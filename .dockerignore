@@ -1,0 +1,16 @@
+node_modules
+dist
+.env
+.env.*
+*.md
+.git
+.gitignore
+.DS_Store
+test-domains.json
+top-1m.csv
+top-1m.csv.zip
+scripts/
+**/__tests__/
+**/*.test.ts
+**/*.spec.ts
+vitest.config.*
