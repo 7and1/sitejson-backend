@@ -906,7 +906,7 @@ describe('registerRoutes auth hook', () => {
     });
 
     expect(response.statusCode).toBe(202);
-    expect(analyzeService.schedule).toHaveBeenCalledWith('xn--bcher-kva.de', false, false, 'normal', false);
+    expect(analyzeService.schedule).toHaveBeenCalledWith('xn--bcher-kva.de', false, false, 'normal', false, undefined);
 
     await app.close();
   });

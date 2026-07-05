@@ -8,7 +8,7 @@ import { ensurePostgresSchema } from '../postgres.js';
 
 describe('ensurePostgresSchema autovacuum tuning', () => {
   it('applies table-level autovacuum settings for high-churn tables', async () => {
-    const query = vi.fn(async () => ({}));
+    const query = vi.fn(async (..._args: unknown[]) => ({}));
     const release = vi.fn();
     const connect = vi.fn(async () => ({
       query,

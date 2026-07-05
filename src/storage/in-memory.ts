@@ -911,13 +911,13 @@ export class InMemoryCrawlTargetRepository implements CrawlTargetRepository {
 
   async update(domain: string, patch: CrawlTargetUpdatePatch): Promise<void> {
     const current = await this.ensureExists(domain);
-    const normalizedPatch: CrawlTargetUpdatePatch = { ...patch };
-    if (Object.prototype.hasOwnProperty.call(normalizedPatch, 'lastContentHash') && normalizedPatch.lastContentHash === null) {
-      normalizedPatch.lastContentHash = undefined;
-    }
+    const { lastContentHash, ...restPatch } = patch;
     const next: CrawlTarget = {
       ...current,
-      ...normalizedPatch,
+      ...restPatch,
+      ...(Object.prototype.hasOwnProperty.call(patch, 'lastContentHash')
+        ? { lastContentHash: lastContentHash ?? undefined }
+        : {}),
       updatedAt: nowIso(),
     };
     this.targets.set(domain, next);

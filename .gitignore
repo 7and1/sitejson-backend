@@ -14,6 +14,6 @@ pnpm-debug.log*
 top-1m.csv
 top-1m.csv.zip
 
-# stray build/tooling cruft (never commit)
-npm-*.tgz
+# stray tooling wrapper leaked from node_modules (never commit)
+# NOTE: npm-10.9.8.tgz is intentionally tracked — it is a build input (Dockerfile COPY)
 backend-tsc

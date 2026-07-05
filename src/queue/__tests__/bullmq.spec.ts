@@ -14,7 +14,7 @@ vi.mock('bullmq', () => ({
     getJobCounts = vi.fn(async () => ({}));
   },
   Worker: class {},
-}), { virtual: true });
+}));
 
 describe('parseRedisUrl', () => {
   it('uses URL credentials when provided', () => {

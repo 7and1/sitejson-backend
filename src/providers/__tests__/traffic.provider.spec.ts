@@ -9,7 +9,7 @@ vi.mock('undici', () => ({
   Agent: class {},
   ProxyAgent: class {},
   fetch: globalThis.fetch,
-}), { virtual: true });
+}));
 
 describe('TrafficProvider Parser', () => {
   const mockRscResponse = `

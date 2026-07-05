@@ -35,3 +35,7 @@ export const retryDlqSchema = z.object({
   queue: z.enum(['ingest', 'browser_realtime', 'browser', 'async', 'radar', 'traffic', 'whois']),
   limit: z.coerce.number().int().min(1).max(1000).optional(),
 });
+
+export const trafficHistoryQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(24).optional(),
+});
