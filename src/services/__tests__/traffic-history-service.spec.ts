@@ -95,15 +95,25 @@ describe('TrafficHistoryService', () => {
     const unconfigured = new TrafficHistoryService({});
     await expect(unconfigured.getHistory('example.com')).resolves.toBeNull();
 
-    fetchWithRetry.mockResolvedValueOnce({
-      status: 404,
-      json: async () => ({}),
-    });
     const configured = new TrafficHistoryService({
       enabled: true,
       baseUrl: 'https://similarweb-api.example.com',
       apiKey: 'sw-key',
     });
+
+    // fetchWithRetry RETURNS a 404 response (defensive path)
+    fetchWithRetry.mockResolvedValueOnce({
+      status: 404,
+      json: async () => ({}),
+    });
     await expect(configured.getHistory('example.com')).resolves.toBeNull();
+
+    // fetchWithRetry THROWS HTTP_404 (real behaviour for non-2xx) -> no history -> null
+    fetchWithRetry.mockRejectedValueOnce(new Error('HTTP_404'));
+    await expect(configured.getHistory('example.com')).resolves.toBeNull();
+
+    // non-404 upstream failures still propagate (route surfaces them as 5xx)
+    fetchWithRetry.mockRejectedValueOnce(new Error('HTTP_502'));
+    await expect(configured.getHistory('example.com')).rejects.toThrow('HTTP_502');
   });
 });

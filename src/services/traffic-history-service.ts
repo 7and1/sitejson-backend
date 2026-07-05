@@ -97,17 +97,28 @@ export class TrafficHistoryService {
       return null;
     }
 
-    const response = await fetchWithRetry(this.buildUrl(domain, options), {
-      timeoutMs: Math.max(1000, Math.trunc(this.config.timeoutMs ?? 12000)),
-      retryAttempts: this.config.retryAttempts ?? 2,
-      retryBaseMs: this.config.retryBaseMs ?? 500,
-      requestInit: {
-        headers: {
-          accept: 'application/json',
-          'x-api-key': this.config.apiKey!.trim(),
+    let response: Awaited<ReturnType<typeof fetchWithRetry>>;
+    try {
+      response = await fetchWithRetry(this.buildUrl(domain, options), {
+        timeoutMs: Math.max(1000, Math.trunc(this.config.timeoutMs ?? 12000)),
+        retryAttempts: this.config.retryAttempts ?? 2,
+        retryBaseMs: this.config.retryBaseMs ?? 500,
+        requestInit: {
+          headers: {
+            accept: 'application/json',
+            'x-api-key': this.config.apiKey!.trim(),
+          },
         },
-      },
-    });
+      });
+    } catch (error) {
+      // fetchWithRetry throws Error('HTTP_<status>') on non-2xx responses. A 404
+      // from the SimilarWeb history API means "no history collected for this domain",
+      // which the route surfaces as a clean 404 — not a 500.
+      if (error instanceof Error && error.message === 'HTTP_404') {
+        return null;
+      }
+      throw error;
+    }
 
     if (response.status === 404) {
       return null;
