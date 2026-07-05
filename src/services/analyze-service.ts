@@ -37,6 +37,7 @@ export class AnalyzeService {
     forceAi = false,
     priority: JobPriority = 'normal',
     skipAi = this.defaultSkipAi,
+    webhookUrl?: string,
   ) {
     const domain = normalizeDomain(domainInput);
     await this.crawlTargets.upsert(domain, {
@@ -93,6 +94,7 @@ export class AnalyzeService {
         source: 'api',
         phase: QUEUE_NAMES.ingest,
         purpose: 'analysis',
+        webhookUrl,
       }, QUEUE_NAMES.ingest);
     } catch (error) {
       const errorMessage = formatEnqueueError(error);

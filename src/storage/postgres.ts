@@ -5,6 +5,7 @@ import type {
   CrawlTarget,
   DirectoryItem,
   DirectorySearchOptions,
+  DirectorySearchResult,
   DirectoryStats,
   DirectoryType,
   DirectoryTypeSummary,
@@ -13,17 +14,20 @@ import type {
   SiteReport,
 } from '../core/types.js';
 import type {
+  BrowserRefreshClaim,
   CrawlTargetRepository,
   CrawlTargetScheduleDue,
   CrawlTargetUpdatePatch,
   JobRepository,
   RadarSnapshotRepository,
   SiteRepository,
+  SiteUpsertOptions,
   TaxonomyData,
   TrafficRefreshOptions,
 } from './interfaces.js';
-import { sanitizeSiteReport } from '../services/report-merge.js';
-import { calculateLegitimacyScore } from '../scoring/legitimacy.js';
+import type { Logger } from '../observability/logger.js';
+import { mergeSiteReports, sanitizeSiteReport } from '../services/report-merge.js';
+import { calculateLegitimacyScore, withCalculatedLegitimacyScore } from '../scoring/legitimacy.js';
 import { normalizeDirectoryList, normalizeDirectorySlug } from './directory-slug.js';
 import {
   ALTERNATIVES_CACHE_ALGORITHM_VERSION,
@@ -31,10 +35,33 @@ import {
   createAlternativesCacheExpiry,
   parseAlternativesCachePayload,
 } from './alternatives-cache.js';
+import { buildSemanticTokens, toSemanticAlternativeItem } from './alternatives-ranking.js';
+import { SwrCache, createRedisSwrPersistence, type RedisLike } from './swr-cache.js';
 
 /** Strip \u0000 (null bytes) that PostgreSQL JSONB rejects */
 const safeJsonStringify = (value: unknown): string =>
   JSON.stringify(value).replaceAll('\\u0000', '');
+
+const stripNonAuthoritativeStoredReportFields = (
+  report: SiteReport | null | undefined,
+): Record<string, unknown> | null => {
+  if (!report || typeof report !== 'object') {
+    return null;
+  }
+
+  const { updatedAt, freshnessTtlSec, score, ...rest } = report as SiteReport & {
+    score?: unknown;
+  };
+  return rest as Record<string, unknown>;
+};
+
+const isStoredReportPayloadEquivalent = (
+  previousReport: SiteReport | null | undefined,
+  nextReport: SiteReport,
+): boolean => (
+  safeJsonStringify(stripNonAuthoritativeStoredReportFields(previousReport))
+  === safeJsonStringify(stripNonAuthoritativeStoredReportFields(nextReport))
+);
 
 type DashboardStatsRow = {
   created_total: string;
@@ -73,6 +100,8 @@ type SiteProfileRow = {
 type AlternativeCandidateRow = {
   domain: string;
   title: string;
+  description: string | null;
+  business_summary: string | null;
   rank: number | null;
   traffic_rank: number | null;
   category_text: string | null;
@@ -87,11 +116,14 @@ type AlternativeCacheRow = {
 type AlternativeCandidate = {
   domain: string;
   title: string;
+  description?: string | null;
+  businessSummary?: string | null;
   rank: number | null;
   trafficRank: number | null;
   categoryText: string | null;
   tags: string[];
   tech: string[];
+  semanticTokens: string[];
 };
 
 type AlternativeTargetSignals = {
@@ -100,6 +132,7 @@ type AlternativeTargetSignals = {
   trafficRank: number | null;
   tags: string[];
   tech: string[];
+  semanticTokens: string[];
 };
 
 type CrawlJobRow = {
@@ -175,6 +208,7 @@ const toNullableIsoTimestamp = (value: string | undefined): string | null => {
 const ALTERNATIVES_CACHE_TTL_MS = 15 * 60 * 1000;
 const ALTERNATIVES_QUERY_LIMIT = 50;
 const ALTERNATIVES_POOL_LIMIT = 200;
+const DEFAULT_BROWSER_REFRESH_TTL_HOURS = 720;
 const LOW_SIGNAL_ALTERNATIVE_SLUGS = new Set([
   'domain-only',
   'insufficient-data',
@@ -193,12 +227,12 @@ const normalizeAlternativeList = (values: string[] | undefined): string[] => {
 
 const mapReportRow = (row: SiteProfileRow): SiteReport => {
   const payload = typeof row.report_json === 'object' && row.report_json ? (row.report_json as SiteReport) : ({} as SiteReport);
-  return sanitizeSiteReport({
+  return withCalculatedLegitimacyScore(sanitizeSiteReport({
     ...payload,
     domain: row.domain,
     updatedAt: row.updated_at,
     freshnessTtlSec: row.freshness_ttl_sec ?? undefined,
-  });
+  }));
 };
 
 const mapJobRow = (row: CrawlJobRow): CrawlJob => {
@@ -316,6 +350,19 @@ const tagsFromReport = (report: SiteReport): string[] => {
 const techFromReport = (report: SiteReport): string[] => {
   return normalizeList(report.meta?.techStackDetected);
 };
+
+const semanticTokensFromReport = (report: SiteReport): string[] => (
+  buildSemanticTokens([
+    report.meta?.title,
+    report.meta?.description,
+    report.taxonomy?.iabCategory,
+    report.aiAnalysis?.business?.summary,
+    report.aiAnalysis?.business?.targetAudience,
+    report.aiAnalysis?.business?.model,
+    ...tagsFromReport(report),
+    ...techFromReport(report),
+  ])
+);
 
 const rankFromReport = (report: SiteReport): number | undefined => {
   const radarRank = report.radar?.globalRank;
@@ -436,6 +483,48 @@ const toDirectoryItem = (report: SiteReport): DirectoryItem => {
   };
 };
 
+// Directory listing rows project only the card fields out of report_json (rather
+// than rehydrating the whole report) and reuse the stored legitimacy_score_int,
+// avoiding wide TOAST reads + a per-row score recompute on every listing page.
+export type DirectoryListingRow = {
+  domain: string;
+  title: string | null;
+  description: string | null;
+  tech_stack: unknown;
+  screenshot_url: string | null;
+  tags: unknown;
+  monthly_visits: string | null;
+  rank_int: number | null;
+  traffic_rank_int: number | null;
+  legitimacy_score_int: number | null;
+  total_count?: string;
+};
+
+export const directoryItemFromListingRow = (row: DirectoryListingRow): DirectoryItem => {
+  const toStringArray = (value: unknown): string[] =>
+    (Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : []);
+  const tags = toStringArray(row.tags).slice(0, 5);
+  const techStack = toStringArray(row.tech_stack).slice(0, 5);
+  const rank = typeof row.rank_int === 'number'
+    ? row.rank_int
+    : (typeof row.traffic_rank_int === 'number' ? row.traffic_rank_int : undefined);
+  const monthlyVisitsNum = row.monthly_visits !== null && row.monthly_visits !== ''
+    ? Number(row.monthly_visits)
+    : NaN;
+
+  return {
+    domain: row.domain,
+    title: row.title ?? row.domain,
+    rank,
+    description: row.description ?? undefined,
+    screenshotUrl: row.screenshot_url ?? undefined,
+    tags: tags.length > 0 ? tags : undefined,
+    techStack: techStack.length > 0 ? techStack : undefined,
+    monthlyVisits: Number.isFinite(monthlyVisitsNum) ? monthlyVisitsNum : undefined,
+    legitimacyScore: typeof row.legitimacy_score_int === 'number' ? row.legitimacy_score_int : 0,
+  };
+};
+
 const compareDirectoryItems = (left: DirectoryItem, right: DirectoryItem): number => {
   if (typeof left.rank === 'number' && typeof right.rank === 'number') {
     return left.rank - right.rank;
@@ -458,8 +547,169 @@ const DEFAULT_ASYNC_TTL_SEC = 30 * 24 * 3600;
 
 export class PostgresSiteRepository implements SiteRepository {
   private readonly alternativesCache = new Map<string, { result: AlternativeSearchResult; expiresAt: number }>();
+  private readonly directoryListingCache: SwrCache<DirectorySearchResult>;
+  private readonly directoryTypeSummaryCache: SwrCache<DirectoryTypeSummary>;
+  private readonly directoryStatsCache: SwrCache<DirectoryStats>;
 
-  constructor(private readonly pool: Pool) {}
+  constructor(private readonly pool: Pool, options?: { cacheRedis?: RedisLike }) {
+    const redis = options?.cacheRedis;
+    // Persist directory caches in Redis (when available) so a redeploy/restart
+    // reads warm values instead of re-running the slow aggregations — this is
+    // what eliminates the cold-start burst of statement timeouts. A 6h Redis
+    // TTL keeps stale-but-usable values around for stale-while-revalidate.
+    const redisTtlSeconds = 6 * 3600;
+    this.directoryListingCache = new SwrCache<DirectorySearchResult>({
+      ttlMs: 600_000,
+      maxEntries: 4000,
+      persist: redis ? createRedisSwrPersistence<DirectorySearchResult>(redis, 'sj:dir:list', redisTtlSeconds) : undefined,
+    });
+    this.directoryTypeSummaryCache = new SwrCache<DirectoryTypeSummary>({
+      ttlMs: 600_000,
+      maxEntries: 64,
+      persist: redis ? createRedisSwrPersistence<DirectoryTypeSummary>(redis, 'sj:dir:summary', redisTtlSeconds) : undefined,
+    });
+    this.directoryStatsCache = new SwrCache<DirectoryStats>({
+      ttlMs: 900_000,
+      maxEntries: 2000,
+      persist: redis ? createRedisSwrPersistence<DirectoryStats>(redis, 'sj:dir:stats', redisTtlSeconds) : undefined,
+    });
+  }
+
+  private buildPersistedSiteProfile(
+    incomingReport: SiteReport,
+    previousReport: SiteReport | null,
+  ): {
+    report: SiteReport;
+    category: string | null;
+    rank: number | null;
+    trafficRank: number | null;
+    tags: string[];
+    tech: string[];
+    legitimacyScore: number;
+  } {
+    const report = withCalculatedLegitimacyScore(mergeSiteReports(previousReport, incomingReport));
+    return {
+      report,
+      category: categoryFromReport(report) ?? null,
+      rank: rankForAlternatives(report) ?? null,
+      trafficRank: trafficRankFromReport(report) ?? null,
+      tags: tagsFromReport(report),
+      tech: techFromReport(report),
+      legitimacyScore: calculateLegitimacyScore(report).value,
+    };
+  }
+
+  private async tryOptimisticUpsert(
+    incomingReport: SiteReport,
+    previousReport: SiteReport | null,
+  ): Promise<boolean> {
+    const persisted = this.buildPersistedSiteProfile(incomingReport, previousReport);
+    const shouldRewriteReportJson = !isStoredReportPayloadEquivalent(previousReport, persisted.report);
+
+    if (!previousReport) {
+      const inserted = await this.pool.query<{ domain: string }>(
+        `INSERT INTO site_profiles (
+           domain,
+           updated_at,
+           freshness_ttl_sec,
+           report_json,
+           category_text,
+           rank_int,
+           traffic_rank_int,
+           tags_search,
+           tech_search,
+           legitimacy_score_int
+         )
+         VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8::text[], $9::text[], $10)
+         ON CONFLICT (domain) DO NOTHING
+         RETURNING domain`,
+        [
+          persisted.report.domain,
+          persisted.report.updatedAt,
+          persisted.report.freshnessTtlSec ?? null,
+          safeJsonStringify(persisted.report),
+          persisted.category,
+          persisted.rank,
+          persisted.trafficRank,
+          persisted.tags,
+          persisted.tech,
+          persisted.legitimacyScore,
+        ],
+      );
+
+      if ((inserted.rowCount ?? 0) > 0) {
+        this.invalidateAlternativesCache(persisted.report.domain);
+        return true;
+      }
+
+      return false;
+    }
+
+    const updated = shouldRewriteReportJson
+      ? await this.pool.query<{ domain: string }>(
+          `UPDATE site_profiles
+           SET updated_at = $2,
+               freshness_ttl_sec = $3,
+               report_json = $4::jsonb,
+               category_text = $5,
+               rank_int = $6,
+               traffic_rank_int = $7,
+               tags_search = $8::text[],
+               tech_search = $9::text[],
+               legitimacy_score_int = $10
+           WHERE domain = $1
+             AND updated_at = $11
+           RETURNING domain`,
+          [
+            persisted.report.domain,
+            persisted.report.updatedAt,
+            persisted.report.freshnessTtlSec ?? null,
+            safeJsonStringify(persisted.report),
+            persisted.category,
+            persisted.rank,
+            persisted.trafficRank,
+            persisted.tags,
+            persisted.tech,
+            persisted.legitimacyScore,
+            previousReport.updatedAt,
+          ],
+        )
+      : await this.pool.query<{ domain: string }>(
+          `UPDATE site_profiles
+           SET updated_at = $2,
+               freshness_ttl_sec = $3,
+               category_text = $4,
+               rank_int = $5,
+               traffic_rank_int = $6,
+               tags_search = $7::text[],
+               tech_search = $8::text[],
+               legitimacy_score_int = $9
+           WHERE domain = $1
+             AND updated_at = $10
+           RETURNING domain`,
+          [
+            persisted.report.domain,
+            persisted.report.updatedAt,
+            persisted.report.freshnessTtlSec ?? null,
+            persisted.category,
+            persisted.rank,
+            persisted.trafficRank,
+            persisted.tags,
+            persisted.tech,
+            persisted.legitimacyScore,
+            previousReport.updatedAt,
+          ],
+        );
+
+    if ((updated.rowCount ?? 0) > 0) {
+      if (shouldRewriteReportJson) {
+        this.invalidateAlternativesCache(persisted.report.domain);
+      }
+      return true;
+    }
+
+    return false;
+  }
 
   private getAlternativesCacheKey(domain: string, limit: number, updatedAt: string): string {
     return `${domain}:${limit}:${updatedAt}`;
@@ -491,11 +741,21 @@ export class PostgresSiteRepository implements SiteRepository {
     return result.rows.map((row) => ({
       domain: row.domain,
       title: row.title,
+      description: row.description,
+      businessSummary: row.business_summary,
       rank: row.rank,
       trafficRank: row.traffic_rank,
       categoryText: row.category_text,
       tags: Array.isArray(row.tags) ? row.tags : [],
       tech: Array.isArray(row.tech) ? row.tech : [],
+      semanticTokens: buildSemanticTokens([
+        row.title,
+        row.description,
+        row.business_summary,
+        row.category_text,
+        ...(Array.isArray(row.tags) ? row.tags : []),
+        ...(Array.isArray(row.tech) ? row.tech : []),
+      ]),
     }));
   }
 
@@ -582,55 +842,107 @@ export class PostgresSiteRepository implements SiteRepository {
     return mapReportRow(result.rows[0]);
   }
 
-  async upsert(report: SiteReport): Promise<void> {
-    const sanitizedReport = sanitizeSiteReport(report);
-    const category = categoryFromReport(sanitizedReport) ?? null;
-    const rank = rankForAlternatives(sanitizedReport) ?? null;
-    const trafficRank = trafficRankFromReport(sanitizedReport) ?? null;
-    const tags = tagsFromReport(sanitizedReport);
-    const tech = techFromReport(sanitizedReport);
-    const legitimacyScore = calculateLegitimacyScore(sanitizedReport).value;
+  async upsert(report: SiteReport, options?: SiteUpsertOptions): Promise<void> {
+    const incomingReport = sanitizeSiteReport(report);
+    if (Object.prototype.hasOwnProperty.call(options ?? {}, 'previousReport')) {
+      const optimisticPrevious = options?.previousReport ?? null;
+      if (await this.tryOptimisticUpsert(incomingReport, optimisticPrevious)) {
+        return;
+      }
+    }
 
-    await this.pool.query(
-      `INSERT INTO site_profiles (
-         domain,
-         updated_at,
-         freshness_ttl_sec,
-         report_json,
-         category_text,
-         rank_int,
-         traffic_rank_int,
-         tags_search,
-         tech_search,
-         legitimacy_score_int
-       )
-       VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8::text[], $9::text[], $10)
-       ON CONFLICT (domain)
-       DO UPDATE SET
-         updated_at = EXCLUDED.updated_at,
-         freshness_ttl_sec = EXCLUDED.freshness_ttl_sec,
-         report_json = EXCLUDED.report_json,
-         category_text = EXCLUDED.category_text,
-         rank_int = EXCLUDED.rank_int,
-         traffic_rank_int = EXCLUDED.traffic_rank_int,
-         tags_search = EXCLUDED.tags_search,
-         tech_search = EXCLUDED.tech_search,
-         legitimacy_score_int = EXCLUDED.legitimacy_score_int`,
-      [
-        sanitizedReport.domain,
-        sanitizedReport.updatedAt,
-        sanitizedReport.freshnessTtlSec ?? null,
-        safeJsonStringify(sanitizedReport),
-        category,
-        rank,
-        trafficRank,
-        tags,
-        tech,
-        legitimacyScore,
-      ],
-    );
+    const client = await this.pool.connect();
 
-    this.invalidateAlternativesCache(sanitizedReport.domain);
+    try {
+      await client.query('BEGIN');
+
+      const existing = await client.query<SiteProfileRow>(
+        `SELECT domain, updated_at, freshness_ttl_sec, report_json
+         FROM site_profiles
+         WHERE domain = $1
+         FOR UPDATE`,
+        [incomingReport.domain],
+      );
+
+      const previousReport = existing.rowCount && existing.rows[0]
+        ? mapReportRow(existing.rows[0])
+        : null;
+      const persisted = this.buildPersistedSiteProfile(incomingReport, previousReport);
+      const shouldRewriteReportJson = !isStoredReportPayloadEquivalent(previousReport, persisted.report);
+
+      await client.query(
+        shouldRewriteReportJson
+          ? `INSERT INTO site_profiles (
+               domain,
+               updated_at,
+               freshness_ttl_sec,
+               report_json,
+               category_text,
+               rank_int,
+               traffic_rank_int,
+               tags_search,
+               tech_search,
+               legitimacy_score_int
+             )
+             VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8::text[], $9::text[], $10)
+             ON CONFLICT (domain)
+             DO UPDATE SET
+               updated_at = EXCLUDED.updated_at,
+               freshness_ttl_sec = EXCLUDED.freshness_ttl_sec,
+               report_json = EXCLUDED.report_json,
+               category_text = EXCLUDED.category_text,
+               rank_int = EXCLUDED.rank_int,
+               traffic_rank_int = EXCLUDED.traffic_rank_int,
+               tags_search = EXCLUDED.tags_search,
+               tech_search = EXCLUDED.tech_search,
+               legitimacy_score_int = EXCLUDED.legitimacy_score_int`
+          : `INSERT INTO site_profiles (
+               domain,
+               updated_at,
+               freshness_ttl_sec,
+               report_json,
+               category_text,
+               rank_int,
+               traffic_rank_int,
+               tags_search,
+               tech_search,
+               legitimacy_score_int
+             )
+             VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8::text[], $9::text[], $10)
+             ON CONFLICT (domain)
+             DO UPDATE SET
+               updated_at = EXCLUDED.updated_at,
+               freshness_ttl_sec = EXCLUDED.freshness_ttl_sec,
+               category_text = EXCLUDED.category_text,
+               rank_int = EXCLUDED.rank_int,
+               traffic_rank_int = EXCLUDED.traffic_rank_int,
+               tags_search = EXCLUDED.tags_search,
+               tech_search = EXCLUDED.tech_search,
+               legitimacy_score_int = EXCLUDED.legitimacy_score_int`,
+        [
+          persisted.report.domain,
+          persisted.report.updatedAt,
+          persisted.report.freshnessTtlSec ?? null,
+          safeJsonStringify(persisted.report),
+          persisted.category,
+          persisted.rank,
+          persisted.trafficRank,
+          persisted.tags,
+          persisted.tech,
+          persisted.legitimacyScore,
+        ],
+      );
+
+      await client.query('COMMIT');
+      if (shouldRewriteReportJson) {
+        this.invalidateAlternativesCache(persisted.report.domain);
+      }
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   private buildDirectoryBaseWhere(type: DirectoryType, slug: string): { condition: string; params: (string | number | null)[] } {
@@ -666,7 +978,38 @@ export class PostgresSiteRepository implements SiteRepository {
     }
   }
 
+  private getDirectoryListingCacheKey(
+    type: DirectoryType,
+    slug: string,
+    page: number,
+    pageSize: number,
+    options?: DirectorySearchOptions,
+  ): string {
+    const safePage = Math.max(1, page);
+    const safePageSize = Math.max(1, Math.min(100, pageSize));
+    return JSON.stringify({
+      type,
+      slug: normalizeSlug(slug),
+      page: safePage,
+      pageSize: safePageSize,
+      sort: options?.sort ?? 'default',
+      minScore: options?.minScore ?? null,
+      hasTraffic: options?.hasTraffic ?? false,
+    });
+  }
+
   async searchDirectory(type: DirectoryType, slug: string, page: number, pageSize: number, options?: DirectorySearchOptions) {
+    const cacheKey = this.getDirectoryListingCacheKey(type, slug, page, pageSize, options);
+    return this.directoryListingCache.get(cacheKey, () => this.computeSearchDirectory(type, slug, page, pageSize, options));
+  }
+
+  private async computeSearchDirectory(
+    type: DirectoryType,
+    slug: string,
+    page: number,
+    pageSize: number,
+    options?: DirectorySearchOptions,
+  ): Promise<DirectorySearchResult> {
     const safePage = Math.max(1, page);
     const safePageSize = Math.max(1, Math.min(100, pageSize));
     const offset = (safePage - 1) * safePageSize;
@@ -685,6 +1028,7 @@ export class PostgresSiteRepository implements SiteRepository {
     }
 
     const whereClause = `WHERE ${base.condition}${extraConditions.length > 0 ? ' AND ' + extraConditions.join(' AND ') : ''}`;
+    const canReuseCachedTotal = extraConditions.length === 0;
 
     const sortMap: Record<string, string> = {
       rank: 'COALESCE(rank_int, 999999999) ASC',
@@ -693,30 +1037,55 @@ export class PostgresSiteRepository implements SiteRepository {
     };
     const orderBy = options?.sort ? (sortMap[options.sort] ?? sortMap.rank) : 'COALESCE(rank_int, traffic_rank_int, 999999999) ASC';
 
-    const result = await this.pool.query<SiteProfileRow>(
-      `SELECT
+    const querySql = `SELECT
          domain,
-         updated_at,
-         freshness_ttl_sec,
-         report_json,
-         COUNT(*) OVER()::text AS total_count
+         report_json->'meta'->>'title' AS title,
+         report_json->'meta'->>'description' AS description,
+         report_json->'meta'->'techStackDetected' AS tech_stack,
+         report_json->'visual'->>'screenshotUrl' AS screenshot_url,
+         report_json->'taxonomy'->'tags' AS tags,
+         report_json->'trafficData'->>'monthlyVisits' AS monthly_visits,
+         rank_int,
+         traffic_rank_int,
+         legitimacy_score_int
        FROM site_profiles
        ${whereClause}
        ORDER BY ${orderBy}
-       LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
-      [...params, safePageSize, offset],
-    );
+       LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
 
-    const total = parseCount(result.rows[0]?.total_count);
+    const [result, total] = canReuseCachedTotal
+      ? await Promise.all([
+          this.pool.query<DirectoryListingRow>(querySql, [...params, safePageSize, offset]),
+          this.getDirectoryStats(type, slug).then((stats) => stats.total),
+        ])
+      : await Promise.all([
+          this.pool.query<DirectoryListingRow>(querySql, [...params, safePageSize, offset]),
+          this.pool.query<{ count: string }>(
+            `SELECT COUNT(*)::text AS count
+             FROM site_profiles
+             ${whereClause}`,
+            params,
+          ).then((countResult) => parseCount(countResult.rows[0]?.count)),
+        ]);
 
-    const items = result.rows
-      .map((row) => mapReportRow(row))
-      .map((report) => toDirectoryItem(report));
+    const resolvedTotal = total;
 
-    return { items, total };
+    const items = result.rows.map((row) => directoryItemFromListingRow(row));
+
+    return { items, total: resolvedTotal };
   }
 
   async getDirectoryStats(type: DirectoryType, slug: string): Promise<DirectoryStats> {
+    // Per-slug stats are an expensive unnest aggregation that changes slowly;
+    // serve stale-while-revalidate so it never blocks the request path (this was
+    // the top statement-timeout 500 source).
+    return this.directoryStatsCache.get(
+      `${type}:${slug}`,
+      () => this.computeDirectoryStats(type, slug),
+    );
+  }
+
+  private async computeDirectoryStats(type: DirectoryType, slug: string): Promise<DirectoryStats> {
     const base = this.buildDirectoryBaseWhere(type, slug);
 
     type StatsRow = {
@@ -834,7 +1203,16 @@ export class PostgresSiteRepository implements SiteRepository {
 
   async getDirectoryTypeSummary(type: DirectoryType, limit = 50): Promise<DirectoryTypeSummary> {
     const safeLimit = Math.max(1, Math.min(200, Math.trunc(limit)));
+    // Facet counts are global and slow-changing; serve stale-while-revalidate so
+    // the slow full-scan / unnest aggregation never runs on the request path
+    // after the first population (prevents statement-timeout 500s under load).
+    return this.directoryTypeSummaryCache.get(
+      `${type}:${safeLimit}`,
+      () => this.computeDirectoryTypeSummary(type, safeLimit),
+    );
+  }
 
+  private async computeDirectoryTypeSummary(type: DirectoryType, safeLimit: number): Promise<DirectoryTypeSummary> {
     type SlugCountRow = { slug: string; count: string; top_domain: string | null; top_title: string | null };
 
     let sql: string;
@@ -926,6 +1304,38 @@ export class PostgresSiteRepository implements SiteRepository {
       totalSites,
       slugs,
     };
+  }
+
+  async prewarmDirectoryCaches(options?: { topSlugsPerType?: number }): Promise<void> {
+    const types: DirectoryType[] = ['category', 'technology', 'topic'];
+    const topN = Math.max(0, Math.trunc(options?.topSlugsPerType ?? 10));
+
+    // Warm facet summaries first (hit on every directory landing page),
+    // sequentially to avoid a self-inflicted contention spike at startup.
+    const summaries: Array<{ type: DirectoryType; summary: DirectoryTypeSummary }> = [];
+    for (const type of types) {
+      try {
+        summaries.push({ type, summary: await this.getDirectoryTypeSummary(type) });
+      } catch {
+        // best-effort warmup; skip this type on failure
+      }
+    }
+
+    // Then warm per-slug stats for the hottest slugs of each type.
+    for (const { type, summary } of summaries) {
+      for (const slug of summary.slugs.slice(0, topN)) {
+        try {
+          await this.getDirectoryStats(type, slug.slug);
+        } catch {
+          // ignore individual slug failures
+        }
+        try {
+          await this.searchDirectory(type, slug.slug, 1, 24);
+        } catch {
+          // ignore individual listing failures
+        }
+      }
+    }
   }
 
   private insightsCache: { data: GlobalInsights; expiresAt: number } | null = null;
@@ -1037,6 +1447,7 @@ export class PostgresSiteRepository implements SiteRepository {
       trafficRank: trafficRankFromReport(target) ?? null,
       tags: tagsFromReport(target),
       tech: techFromReport(target),
+      semanticTokens: semanticTokensFromReport(target),
     };
 
     const cacheKey = this.getAlternativesCacheKey(target.domain, safeLimit, target.updatedAt);
@@ -1061,7 +1472,7 @@ export class PostgresSiteRepository implements SiteRepository {
     if (!targetSignals.category && targetSignals.tags.length === 0 && !targetSignals.rank && !targetSignals.trafficRank) {
       const emptyResult: AlternativeSearchResult = {
         items: [],
-        algorithm: 'rule_based',
+        algorithm: 'semantic_embedding',
       };
       this.alternativesCache.set(cacheKey, {
         result: emptyResult,
@@ -1093,6 +1504,8 @@ export class PostgresSiteRepository implements SiteRepository {
     const candidateSelect = `SELECT
        domain,
        COALESCE(report_json->'meta'->>'title', domain) AS title,
+       COALESCE(report_json->'meta'->>'description', '') AS description,
+       COALESCE(report_json->'aiAnalysis'->'business'->>'summary', '') AS business_summary,
        rank_int AS rank,
        traffic_rank_int AS traffic_rank,
        category_text,
@@ -1159,9 +1572,9 @@ export class PostgresSiteRepository implements SiteRepository {
     }
 
     const alternativesResult: AlternativeSearchResult = {
-      algorithm: 'rule_based',
+      algorithm: 'semantic_embedding',
       items: Array.from(mergedCandidates.values())
-        .map((candidate) => toAlternativeItem(targetSignals, candidate))
+        .map((candidate) => toSemanticAlternativeItem(targetSignals, candidate))
         .sort((left, right) => {
           if (right.score !== left.score) {
             return right.score - left.score;
@@ -1216,7 +1629,9 @@ export class PostgresRadarSnapshotRepository implements RadarSnapshotRepository 
        ON CONFLICT (domain)
        DO UPDATE SET
          updated_at = EXCLUDED.updated_at,
-         payload_json = EXCLUDED.payload_json`,
+         payload_json = EXCLUDED.payload_json
+       WHERE radar_snapshots.payload_json IS DISTINCT FROM EXCLUDED.payload_json
+          OR radar_snapshots.updated_at IS DISTINCT FROM EXCLUDED.updated_at`,
       [snapshot.domain, snapshot.updatedAt, safeJsonStringify(snapshot)],
     );
   }
@@ -1237,7 +1652,9 @@ export class PostgresRadarSnapshotRepository implements RadarSnapshotRepository 
        ON CONFLICT (domain)
        DO UPDATE SET
          updated_at = EXCLUDED.updated_at,
-         payload_json = EXCLUDED.payload_json`,
+         payload_json = EXCLUDED.payload_json
+       WHERE radar_snapshots.payload_json IS DISTINCT FROM EXCLUDED.payload_json
+          OR radar_snapshots.updated_at IS DISTINCT FROM EXCLUDED.updated_at`,
       [domains, updatedAts, payloads],
     );
   }
@@ -1518,6 +1935,33 @@ export class PostgresJobRepository implements JobRepository {
     }));
   }
 
+  async releaseStaleActiveJobs(options?: { staleHours?: number; limit?: number }): Promise<number> {
+    const staleHours = Math.max(1, Math.trunc(options?.staleHours ?? 2));
+    const safeLimit = Math.max(1, Math.trunc(options?.limit ?? 5_000));
+
+    const result = await this.pool.query(
+      `WITH picked AS (
+         SELECT id
+         FROM crawl_jobs
+         WHERE status IN ('pending', 'running')
+           AND updated_at < NOW() - (($2::text || ' hours')::interval)
+         ORDER BY updated_at ASC, created_at ASC
+         LIMIT $1
+         FOR UPDATE SKIP LOCKED
+       )
+       UPDATE crawl_jobs AS target
+       SET status = 'failed',
+           stage = 'stale_active_reaped',
+           error_message = 'Released stale active job after ' || $2::text || 'h',
+           updated_at = NOW()
+       FROM picked
+       WHERE target.id = picked.id`,
+      [safeLimit, staleHours],
+    );
+
+    return result.rowCount ?? 0;
+  }
+
   async healthCheck(): Promise<boolean> {
     try {
       await this.pool.query('SELECT 1');
@@ -1530,6 +1974,36 @@ export class PostgresJobRepository implements JobRepository {
 
 export class PostgresCrawlTargetRepository implements CrawlTargetRepository {
   constructor(private readonly pool: Pool) {}
+
+  private async insertIfMissing(
+    domain: string,
+    options?: { priority?: number; isHighValue?: boolean },
+  ): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO crawl_targets (domain, priority, is_high_value, created_at, updated_at)
+       VALUES ($1, COALESCE($2, 1), COALESCE($3, false), NOW(), NOW())
+       ON CONFLICT (domain) DO NOTHING`,
+      [domain, options?.priority ?? null, options?.isHighValue ?? null],
+    );
+  }
+
+  private async ensureExists(
+    domain: string,
+    options?: { priority?: number; isHighValue?: boolean },
+  ): Promise<CrawlTarget> {
+    const existing = await this.getByDomain(domain);
+    if (existing) {
+      return existing;
+    }
+
+    await this.insertIfMissing(domain, options);
+    const created = await this.getByDomain(domain);
+    if (!created) {
+      throw new Error(`Failed to ensure crawl target exists for ${domain}`);
+    }
+
+    return created;
+  }
 
   async upsert(domain: string, options?: { priority?: number; isHighValue?: boolean }): Promise<CrawlTarget> {
     const result = await this.pool.query<CrawlTargetRow>(
@@ -1628,7 +2102,8 @@ export class PostgresCrawlTargetRepository implements CrawlTargetRepository {
        SET radar_rank = data.radar_rank,
            updated_at = NOW()
        FROM UNNEST($1::text[], $2::int[]) AS data(domain, radar_rank)
-       WHERE target.domain = data.domain`,
+       WHERE target.domain = data.domain
+         AND target.radar_rank IS DISTINCT FROM data.radar_rank`,
       [domains, radarRanks],
     );
   }
@@ -1639,15 +2114,13 @@ export class PostgresCrawlTargetRepository implements CrawlTargetRepository {
     status: CrawlTarget['lastBrowserStatus'],
     options?: { ttlSec?: number; errorBackoffSec?: number },
   ): Promise<void> {
-    await this.upsert(domain);
-
     const ttlSec = options?.ttlSec
       ?? (layer === 'browser' ? DEFAULT_BROWSER_TTL_SEC : layer === 'radar' ? DEFAULT_RADAR_TTL_SEC : DEFAULT_ASYNC_TTL_SEC);
 
     const backoffSec = options?.errorBackoffSec ?? 24 * 3600;
 
     if (layer === 'browser') {
-      await this.pool.query(
+      const result = await this.pool.query(
         `UPDATE crawl_targets
          SET last_browser_status = $2,
              last_browser_at = CASE WHEN $2 = 'success' THEN NOW() ELSE last_browser_at END,
@@ -1661,11 +2134,28 @@ export class PostgresCrawlTargetRepository implements CrawlTargetRepository {
          WHERE domain = $1`,
         [domain, status, ttlSec, backoffSec],
       );
+      if ((result.rowCount ?? 0) === 0) {
+        await this.insertIfMissing(domain);
+        await this.pool.query(
+          `UPDATE crawl_targets
+           SET last_browser_status = $2,
+               last_browser_at = CASE WHEN $2 = 'success' THEN NOW() ELSE last_browser_at END,
+               next_browser_at = CASE
+                 WHEN $2 = 'success' THEN NOW() + make_interval(secs => $3)
+                 WHEN $2 = 'failed' THEN NOW() + make_interval(secs => $4)
+                 ELSE next_browser_at
+               END,
+               error_count = CASE WHEN $2 = 'failed' THEN error_count + 1 ELSE error_count END,
+               updated_at = NOW()
+           WHERE domain = $1`,
+          [domain, status, ttlSec, backoffSec],
+        );
+      }
       return;
     }
 
     if (layer === 'radar') {
-      await this.pool.query(
+      const result = await this.pool.query(
         `UPDATE crawl_targets
          SET last_radar_status = $2,
              last_radar_at = CASE WHEN $2 = 'success' THEN NOW() ELSE last_radar_at END,
@@ -1679,11 +2169,28 @@ export class PostgresCrawlTargetRepository implements CrawlTargetRepository {
          WHERE domain = $1`,
         [domain, status, ttlSec, backoffSec],
       );
+      if ((result.rowCount ?? 0) === 0) {
+        await this.insertIfMissing(domain);
+        await this.pool.query(
+          `UPDATE crawl_targets
+           SET last_radar_status = $2,
+               last_radar_at = CASE WHEN $2 = 'success' THEN NOW() ELSE last_radar_at END,
+               next_radar_at = CASE
+                 WHEN $2 = 'success' THEN NOW() + make_interval(secs => $3)
+                 WHEN $2 = 'failed' THEN NOW() + make_interval(secs => $4)
+                 ELSE next_radar_at
+               END,
+               error_count = CASE WHEN $2 = 'failed' THEN error_count + 1 ELSE error_count END,
+               updated_at = NOW()
+           WHERE domain = $1`,
+          [domain, status, ttlSec, backoffSec],
+        );
+      }
       return;
     }
 
     // async layer
-    await this.pool.query(
+    const result = await this.pool.query(
       `UPDATE crawl_targets
        SET last_async_status = $2,
            last_async_at = CASE WHEN $2 = 'success' THEN NOW() ELSE last_async_at END,
@@ -1692,13 +2199,25 @@ export class PostgresCrawlTargetRepository implements CrawlTargetRepository {
        WHERE domain = $1`,
       [domain, status],
     );
+    if ((result.rowCount ?? 0) === 0) {
+      await this.insertIfMissing(domain);
+      await this.pool.query(
+        `UPDATE crawl_targets
+         SET last_async_status = $2,
+             last_async_at = CASE WHEN $2 = 'success' THEN NOW() ELSE last_async_at END,
+             error_count = CASE WHEN $2 = 'failed' THEN error_count + 1 ELSE error_count END,
+             updated_at = NOW()
+         WHERE domain = $1`,
+        [domain, status],
+      );
+    }
   }
 
   async update(domain: string, patch: CrawlTargetUpdatePatch): Promise<void> {
-    await this.upsert(domain);
+    const hasLastContentHashPatch = Object.prototype.hasOwnProperty.call(patch, 'lastContentHash');
 
-    await this.pool.query(
-        `UPDATE crawl_targets
+    const result = await this.pool.query(
+      `UPDATE crawl_targets
        SET priority = COALESCE($2, priority),
            is_high_value = COALESCE($3, is_high_value),
            radar_rank = COALESCE($4, radar_rank),
@@ -1720,9 +2239,9 @@ export class PostgresCrawlTargetRepository implements CrawlTargetRepository {
            taxonomy_prompt_version = COALESCE($20, taxonomy_prompt_version),
            taxonomy_last_trigger_reason = COALESCE($21, taxonomy_last_trigger_reason),
            taxonomy_source_lane = COALESCE($22, taxonomy_source_lane),
-           last_content_hash = COALESCE($23, last_content_hash),
-           error_count = COALESCE($24, error_count),
-           whois_error_count = COALESCE($25, whois_error_count),
+           last_content_hash = CASE WHEN $23 THEN $24 ELSE last_content_hash END,
+           error_count = COALESCE($25, error_count),
+           whois_error_count = COALESCE($26, whois_error_count),
            updated_at = NOW()
        WHERE domain = $1`,
       [
@@ -1748,15 +2267,79 @@ export class PostgresCrawlTargetRepository implements CrawlTargetRepository {
         patch.taxonomyPromptVersion ?? null,
         patch.taxonomyLastTriggerReason ?? null,
         patch.taxonomySourceLane ?? null,
+        hasLastContentHashPatch,
         patch.lastContentHash ?? null,
         patch.errorCount ?? null,
         patch.whoisErrorCount ?? null,
       ],
     );
+    if ((result.rowCount ?? 0) === 0) {
+      await this.insertIfMissing(domain, {
+        priority: patch.priority,
+        isHighValue: patch.isHighValue,
+      });
+      await this.pool.query(
+        `UPDATE crawl_targets
+         SET priority = COALESCE($2, priority),
+             is_high_value = COALESCE($3, is_high_value),
+             radar_rank = COALESCE($4, radar_rank),
+             last_browser_at = COALESCE($5, last_browser_at),
+             next_browser_at = COALESCE($6, next_browser_at),
+             last_browser_status = COALESCE($7, last_browser_status),
+             last_async_at = COALESCE($8, last_async_at),
+             last_async_status = COALESCE($9, last_async_status),
+             last_radar_at = COALESCE($10, last_radar_at),
+             next_radar_at = COALESCE($11, next_radar_at),
+             last_radar_status = COALESCE($12, last_radar_status),
+             last_traffic_at = COALESCE($13, last_traffic_at),
+             next_traffic_at = COALESCE($14, next_traffic_at),
+             last_whois_at = COALESCE($15, last_whois_at),
+             next_whois_at = COALESCE($16, next_whois_at),
+             taxonomy_data = COALESCE($17::jsonb, taxonomy_data),
+             taxonomy_updated_at = COALESCE($18, taxonomy_updated_at),
+             taxonomy_model = COALESCE($19, taxonomy_model),
+             taxonomy_prompt_version = COALESCE($20, taxonomy_prompt_version),
+             taxonomy_last_trigger_reason = COALESCE($21, taxonomy_last_trigger_reason),
+             taxonomy_source_lane = COALESCE($22, taxonomy_source_lane),
+             last_content_hash = CASE WHEN $23 THEN $24 ELSE last_content_hash END,
+             error_count = COALESCE($25, error_count),
+             whois_error_count = COALESCE($26, whois_error_count),
+             updated_at = NOW()
+         WHERE domain = $1`,
+        [
+          domain,
+          patch.priority ?? null,
+          patch.isHighValue ?? null,
+          patch.radarRank ?? null,
+          patch.lastBrowserAt ?? null,
+          patch.nextBrowserAt ?? null,
+          patch.lastBrowserStatus ?? null,
+          patch.lastAsyncAt ?? null,
+          patch.lastAsyncStatus ?? null,
+          patch.lastRadarAt ?? null,
+          patch.nextRadarAt ?? null,
+          patch.lastRadarStatus ?? null,
+          patch.lastTrafficAt ?? null,
+          patch.nextTrafficAt ?? null,
+          patch.lastWhoisAt ?? null,
+          patch.nextWhoisAt ?? null,
+          patch.taxonomyData ? safeJsonStringify(patch.taxonomyData) : null,
+          patch.taxonomyUpdatedAt ?? null,
+          patch.taxonomyModel ?? null,
+          patch.taxonomyPromptVersion ?? null,
+          patch.taxonomyLastTriggerReason ?? null,
+          patch.taxonomySourceLane ?? null,
+          hasLastContentHashPatch,
+          patch.lastContentHash ?? null,
+          patch.errorCount ?? null,
+          patch.whoisErrorCount ?? null,
+        ],
+      );
+    }
   }
 
   async evaluateDue(domain: string, options?: TrafficRefreshOptions): Promise<CrawlTargetScheduleDue> {
-    const target = await this.upsert(domain);
+    const target = await this.getByDomain(domain) ?? await this.ensureExists(domain);
     const forceRefresh = options?.forceRefresh ?? false;
     const now = Date.now();
 
@@ -1788,11 +2371,7 @@ export class PostgresCrawlTargetRepository implements CrawlTargetRepository {
     const result = await this.pool.query<CrawlTargetRow>(
       `SELECT *
        FROM crawl_targets
-       WHERE next_browser_at IS NULL
-          OR next_radar_at IS NULL
-          OR last_async_at IS NULL
-          OR next_browser_at <= NOW()
-          OR next_radar_at <= NOW()
+       WHERE next_due_at <= NOW()
        ORDER BY priority DESC, updated_at ASC
        LIMIT $1`,
       [safeLimit],
@@ -1825,18 +2404,20 @@ export class PostgresCrawlTargetRepository implements CrawlTargetRepository {
 
   async getTopByRadarRank(
     limit: number,
-    options?: { dueOnly?: boolean },
+    options?: { dueOnly?: boolean; maxRadarRank?: number },
   ): Promise<Array<{ domain: string; radarRank: number }>> {
     const safeLimit = Math.max(1, Math.trunc(limit));
     const dueOnly = options?.dueOnly ?? false;
+    const maxRadarRank = options?.maxRadarRank ? Math.max(1, Math.trunc(options.maxRadarRank)) : undefined;
     const result = await this.pool.query<{ domain: string; radar_rank: number }>(
       `SELECT domain, radar_rank
        FROM crawl_targets
        WHERE radar_rank IS NOT NULL
          ${dueOnly ? 'AND (next_traffic_at IS NULL OR next_traffic_at <= NOW())' : ''}
+         ${maxRadarRank ? 'AND radar_rank <= $2' : ''}
        ORDER BY radar_rank ASC
        LIMIT $1`,
-      [safeLimit],
+      maxRadarRank ? [safeLimit, maxRadarRank] : [safeLimit],
     );
 
     return result.rows.map((row) => ({
@@ -1872,7 +2453,7 @@ export class PostgresCrawlTargetRepository implements CrawlTargetRepository {
     options?: { maxRadarRank?: number },
   ): Promise<Array<{ domain: string; radarRank: number; isHighValue: boolean }>> {
     const safeLimit = Math.max(1, Math.trunc(limit));
-    const maxRadarRank = Math.max(1, Math.trunc(options?.maxRadarRank ?? 100_000));
+    const maxRadarRank = Math.max(1, Math.trunc(options?.maxRadarRank ?? 1_000_000));
 
     const result = await this.pool.query<{ domain: string; radar_rank: number; is_high_value: boolean }>(
       `SELECT domain, radar_rank, is_high_value
@@ -1899,7 +2480,7 @@ export class PostgresCrawlTargetRepository implements CrawlTargetRepository {
     options?: { maxRadarRank?: number },
   ): Promise<Array<{ domain: string; radarRank: number; isHighValue: boolean }>> {
     const safeLimit = Math.max(1, Math.trunc(limit));
-    const maxRadarRank = Math.max(1, Math.trunc(options?.maxRadarRank ?? 100_000));
+    const maxRadarRank = Math.max(1, Math.trunc(options?.maxRadarRank ?? 1_000_000));
 
     const result = await this.pool.query<{ domain: string; radar_rank: number; is_high_value: boolean }>(
       `WITH picked AS (
@@ -1944,6 +2525,134 @@ export class PostgresCrawlTargetRepository implements CrawlTargetRepository {
          AND last_browser_status = 'pending'`,
       [domains],
     );
+  }
+
+  async countDueBrowserRefreshDomains(
+    options?: { maxRadarRank?: number; refreshTtlHours?: number },
+  ): Promise<number> {
+    const maxRadarRank = Math.max(1, Math.trunc(options?.maxRadarRank ?? 100_000));
+    const refreshTtlHours = Math.max(1, Math.trunc(options?.refreshTtlHours ?? DEFAULT_BROWSER_REFRESH_TTL_HOURS));
+
+    const result = await this.pool.query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count
+       FROM crawl_targets
+       WHERE radar_rank IS NOT NULL
+         AND radar_rank > 0
+         AND radar_rank <= $1
+         AND (last_browser_status IS NULL OR last_browser_status NOT IN ('pending', 'running'))
+         AND (next_browser_at IS NULL OR next_browser_at <= NOW())
+         AND (
+           last_browser_at IS NULL
+           OR last_browser_at <= NOW() - (($2::text || ' hours')::interval)
+         )`,
+      [maxRadarRank, refreshTtlHours],
+    );
+
+    return parseCount(result.rows[0]?.count);
+  }
+
+  async claimDueBrowserRefreshDomains(
+    limit: number,
+    options?: { maxRadarRank?: number; refreshTtlHours?: number },
+  ): Promise<BrowserRefreshClaim[]> {
+    const safeLimit = Math.max(1, Math.trunc(limit));
+    const maxRadarRank = Math.max(1, Math.trunc(options?.maxRadarRank ?? 100_000));
+    const refreshTtlHours = Math.max(1, Math.trunc(options?.refreshTtlHours ?? DEFAULT_BROWSER_REFRESH_TTL_HOURS));
+
+    const result = await this.pool.query<{
+      domain: string;
+      radar_rank: number;
+      is_high_value: boolean;
+      previous_browser_status: CrawlTarget['lastBrowserStatus'] | null;
+    }>(
+      `WITH picked AS (
+         SELECT ctid, domain, radar_rank, is_high_value, last_browser_status
+         FROM crawl_targets
+         WHERE radar_rank IS NOT NULL
+           AND radar_rank > 0
+           AND radar_rank <= $2
+           AND (last_browser_status IS NULL OR last_browser_status NOT IN ('pending', 'running'))
+           AND (next_browser_at IS NULL OR next_browser_at <= NOW())
+           AND (
+             last_browser_at IS NULL
+             OR last_browser_at <= NOW() - (($3::text || ' hours')::interval)
+           )
+         ORDER BY radar_rank ASC, priority DESC, updated_at ASC
+         LIMIT $1
+         FOR UPDATE SKIP LOCKED
+       )
+       UPDATE crawl_targets AS target
+       SET last_browser_status = 'pending',
+           updated_at = NOW()
+       FROM picked
+       WHERE target.ctid = picked.ctid
+       RETURNING target.domain,
+                 target.radar_rank,
+                 target.is_high_value,
+                 picked.last_browser_status AS previous_browser_status`,
+      [safeLimit, maxRadarRank, refreshTtlHours],
+    );
+
+    return result.rows.map((row) => ({
+      domain: row.domain,
+      radarRank: row.radar_rank,
+      isHighValue: row.is_high_value || row.radar_rank <= 100_000,
+      previousBrowserStatus: row.previous_browser_status ?? undefined,
+    }));
+  }
+
+  async releaseClaimedBrowserRefreshDomains(claims: BrowserRefreshClaim[]): Promise<void> {
+    if (claims.length === 0) {
+      return;
+    }
+
+    await this.pool.query(
+      `UPDATE crawl_targets AS target
+       SET last_browser_status = data.previous_browser_status,
+           updated_at = NOW()
+       FROM UNNEST($1::text[], $2::text[]) AS data(domain, previous_browser_status)
+       WHERE target.domain = data.domain
+         AND target.last_browser_status = 'pending'`,
+      [
+        claims.map((claim) => claim.domain),
+        claims.map((claim) => claim.previousBrowserStatus ?? null),
+      ],
+    );
+  }
+
+  async releaseStaleBrowserPending(
+    options?: { staleHours?: number; limit?: number; maxRadarRank?: number },
+  ): Promise<number> {
+    const staleHours = Math.max(1, Math.trunc(options?.staleHours ?? 24));
+    const safeLimit = Math.max(1, Math.trunc(options?.limit ?? 5_000));
+    const maxRadarRank = options?.maxRadarRank ? Math.max(1, Math.trunc(options.maxRadarRank)) : null;
+
+    const result = await this.pool.query(
+      `WITH picked AS (
+         SELECT ctid
+         FROM crawl_targets
+         WHERE last_browser_status = 'pending'
+           AND updated_at < NOW() - (($2::text || ' hours')::interval)
+           AND (
+             $3::int IS NULL
+             OR (radar_rank IS NOT NULL AND radar_rank > 0 AND radar_rank <= $3)
+           )
+         ORDER BY COALESCE(radar_rank, 2147483647) ASC, updated_at ASC
+         LIMIT $1
+         FOR UPDATE SKIP LOCKED
+       )
+       UPDATE crawl_targets AS target
+       SET last_browser_status = CASE
+             WHEN last_browser_at IS NOT NULL THEN 'success'
+             ELSE NULL
+           END,
+           updated_at = NOW()
+       FROM picked
+       WHERE target.ctid = picked.ctid`,
+      [safeLimit, staleHours, maxRadarRank],
+    );
+
+    return result.rowCount ?? 0;
   }
 
   async getBrowserSuccessTaxonomyMissingDomains(
@@ -1999,16 +2708,69 @@ export class PostgresCrawlTargetRepository implements CrawlTargetRepository {
   }
 }
 
-export const createPostgresPool = (databaseUrl: string): Pool => {
-  return new Pool({
+export type PostgresPoolOptions = {
+  max?: number;
+  statementTimeoutMs?: number;
+  applicationName?: string;
+  logger?: Logger;
+};
+
+export const createPostgresPool = (databaseUrl: string, options: PostgresPoolOptions = {}): Pool => {
+  const pool = new Pool({
     connectionString: databaseUrl,
-    max: 10,
+    max: Math.max(1, Math.trunc(options.max ?? 10)),
     idleTimeoutMillis: 30000,
     connectionTimeoutMillis: 5000,
   });
+
+  pool.on('connect', (client) => {
+    const statementTimeoutMs = Math.max(1, Math.trunc(options.statementTimeoutMs ?? 30000));
+    const applicationName = options.applicationName?.trim();
+    const setupQueries = [
+      client.query('SELECT set_config($1, $2, false)', ['statement_timeout', `${statementTimeoutMs}ms`]),
+      ...(applicationName ? [client.query('SELECT set_config($1, $2, false)', ['application_name', applicationName])] : []),
+    ];
+
+    void Promise.all(setupQueries).catch((error) => {
+      options.logger?.warn({
+        module: 'postgres',
+        event: 'client_session_setup_failed',
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
+  });
+
+  pool.on('error', (error) => {
+    options.logger?.error({
+      module: 'postgres',
+      event: 'pool_idle_client_error',
+      error: error.message,
+    });
+  });
+
+  return pool;
 };
 
 export const ensurePostgresSchema = async (pool: Pool): Promise<void> => {
+  const client = await pool.connect();
+  let lockHeld = false;
+  const lockedPool: Pick<Pool, 'query'> = {
+    query: client.query.bind(client) as Pool['query'],
+  };
+
+  try {
+    await client.query('SELECT pg_advisory_lock($1)', [727274001]);
+    lockHeld = true;
+
+    {
+      const pool = lockedPool;
+
+      try {
+        await pool.query('CREATE EXTENSION IF NOT EXISTS pg_stat_statements');
+      } catch (error) {
+        console.warn('pg_stat_statements extension unavailable:', error instanceof Error ? error.message : String(error));
+      }
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS site_profiles (
       domain TEXT PRIMARY KEY,
@@ -2080,7 +2842,17 @@ export const ensurePostgresSchema = async (pool: Pool): Promise<void> => {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       error_count INTEGER NOT NULL DEFAULT 0,
-      whois_error_count INTEGER NOT NULL DEFAULT 0
+      whois_error_count INTEGER NOT NULL DEFAULT 0,
+      next_due_at TIMESTAMPTZ GENERATED ALWAYS AS (
+        LEAST(
+          COALESCE(next_browser_at, '-infinity'::timestamptz),
+          COALESCE(next_radar_at, '-infinity'::timestamptz),
+          CASE
+            WHEN last_async_at IS NULL THEN '-infinity'::timestamptz
+            ELSE 'infinity'::timestamptz
+          END
+        )
+      ) STORED
     );
   `);
 
@@ -2109,6 +2881,41 @@ export const ensurePostgresSchema = async (pool: Pool): Promise<void> => {
   await pool.query('ALTER TABLE crawl_targets ADD COLUMN IF NOT EXISTS taxonomy_prompt_version INTEGER');
   await pool.query('ALTER TABLE crawl_targets ADD COLUMN IF NOT EXISTS taxonomy_last_trigger_reason TEXT');
   await pool.query('ALTER TABLE crawl_targets ADD COLUMN IF NOT EXISTS taxonomy_source_lane TEXT');
+  await pool.query(`
+    ALTER TABLE crawl_targets
+    ADD COLUMN IF NOT EXISTS next_due_at TIMESTAMPTZ GENERATED ALWAYS AS (
+      LEAST(
+        COALESCE(next_browser_at, '-infinity'::timestamptz),
+        COALESCE(next_radar_at, '-infinity'::timestamptz),
+        CASE
+          WHEN last_async_at IS NULL THEN '-infinity'::timestamptz
+          ELSE 'infinity'::timestamptz
+        END
+      )
+    ) STORED
+  `);
+
+  // High-churn tables need tighter autovacuum thresholds than the defaults to
+  // avoid dead-tuple/WAL buildup under steady write load.
+  await pool.query(`
+    ALTER TABLE crawl_targets
+    SET (
+      autovacuum_vacuum_scale_factor = 0.02,
+      autovacuum_analyze_scale_factor = 0.01
+    )
+  `);
+  await pool.query(`
+    ALTER TABLE site_profiles
+    SET (
+      autovacuum_vacuum_scale_factor = 0.05
+    )
+  `);
+  await pool.query(`
+    ALTER TABLE radar_snapshots
+    SET (
+      autovacuum_vacuum_scale_factor = 0.02
+    )
+  `);
 
   // Backfill safeguard: keep only the newest active job per domain before creating uniqueness index.
   await pool.query(`
@@ -2243,6 +3050,11 @@ export const ensurePostgresSchema = async (pool: Pool): Promise<void> => {
   `);
 
   await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_crawl_targets_next_due_priority
+      ON crawl_targets (next_due_at ASC, priority DESC, updated_at ASC);
+  `);
+
+  await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_crawl_targets_first_run_rank
       ON crawl_targets (radar_rank ASC, priority DESC, updated_at ASC)
       WHERE radar_rank IS NOT NULL
@@ -2256,4 +3068,15 @@ export const ensurePostgresSchema = async (pool: Pool): Promise<void> => {
       WHERE last_browser_status = 'success'
         AND taxonomy_data IS NULL;
   `);
+    }
+  } finally {
+    if (lockHeld) {
+      try {
+        await client.query('SELECT pg_advisory_unlock($1)', [727274001]);
+      } catch {
+        // The session may already be gone; release below handles the client lifecycle.
+      }
+    }
+    client.release();
+  }
 };

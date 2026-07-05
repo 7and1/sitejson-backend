@@ -1,7 +1,7 @@
 import type { CrawlContext } from '../core/types.js';
 import { providerFailure, providerSuccess } from './base.js';
 import type { Provider } from './base.js';
-import { fetchWithRetry, readBoundedText } from './http.js';
+import { fetchDirectWithSafeRedirects, readBoundedText } from './http.js';
 import type { ProviderRuntimeOptions, PublisherData } from './types.js';
 
 const normalizeAdsTxtLine = (line: string): string => {
@@ -66,7 +66,7 @@ export class PublisherProvider implements Provider<PublisherData> {
 
     try {
       const adsUrl = `https://${ctx.domain}/ads.txt`;
-      const response = await fetchWithRetry(adsUrl, {
+      const response = await fetchDirectWithSafeRedirects(adsUrl, {
         timeoutMs: this.options.timeoutMs ?? 10000,
         retryAttempts: this.options.retryAttempts ?? 1,
         retryBaseMs: this.options.retryBaseMs ?? 250,
@@ -75,7 +75,6 @@ export class PublisherProvider implements Provider<PublisherData> {
             'user-agent': this.userAgent,
             accept: 'text/plain,*/*',
           },
-          redirect: 'follow',
         },
       });
 

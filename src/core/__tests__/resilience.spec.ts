@@ -15,6 +15,8 @@ const providerOptions = {
 
 const runtimeOptions = {
   timeoutMs: 100,
+  providerQuickTimeoutMs: 25,
+  aiTimeoutMs: 250,
   retryAttempts: 0,
   retryBaseMs: 1,
   userAgent: 'SiteJSONTest/1.0',
@@ -23,6 +25,7 @@ const runtimeOptions = {
   browserEnabled: true,
   browserTimeoutMs: 100,
   browserHighValueTimeoutMs: 150,
+  browserNetworkIdleTimeoutMs: 25,
   browserViewport: { width: 1200, height: 700 },
   proxyGridBaseUrl: 'http://localhost:9000',
   proxyGridSecret: 'grid-secret',
@@ -39,10 +42,14 @@ describe('Orchestrator resilience', () => {
 
   it('falls back to HTML chain when browser lane crashes', async () => {
     vi.spyOn(dns, 'resolve4').mockResolvedValue(['93.184.216.34']);
+    vi.spyOn(dns, 'resolve6').mockResolvedValue([]);
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response('', { status: 200 }),
     );
     vi.spyOn(chromium, 'launch').mockRejectedValue(new Error('CRITICAL_BROWSER_CRASH'));
+    vi.spyOn(httpModule, 'fetchDirectWithSafeRedirects').mockResolvedValue(
+      new Response('', { status: 200 }),
+    );
 
     vi.spyOn(httpModule, 'fetchHtmlWithFallbackChain').mockResolvedValue({
       html: '<html><head><title>Fallback Title</title><meta name="description" content="fallback"></head><body><h1>Fallback H1</h1></body></html>',

@@ -5,7 +5,6 @@ import { QUEUE_NAMES } from '../queue/names.js';
 import type { SiteReport } from '../core/types.js';
 import type { CrawlTargetRepository, JobRepository, SiteRepository } from '../storage/interfaces.js';
 import type { Orchestrator } from '../core/orchestrator.js';
-import { mergeSiteReports } from '../services/report-merge.js';
 
 const HOUR_MS = 3_600_000;
 
@@ -86,14 +85,17 @@ export class WhoisWorker {
   async process(payload: QueueJobPayload): Promise<void> {
     const { domain, traceId, crawlJobId } = payload;
     const now = new Date();
-    const target = await this.crawlTargets.getByDomain(domain);
+    const [previous, target] = await Promise.all([
+      this.sites.getByDomain(domain),
+      this.crawlTargets.getByDomain(domain),
+    ]);
 
     if (!payload.forceRefresh) {
       const nextWhoisAtMs = this.parseTimestamp(target?.nextWhoisAt);
       if (nextWhoisAtMs !== null && now.getTime() < nextWhoisAtMs) {
         this.skipCooldownCount += 1;
         const shouldLogInfo = this.skipCooldownCount <= 5 || this.skipCooldownCount % 1000 === 0;
-        (shouldLogInfo ? this.logger.info : this.logger.debug)({
+        this.logger[shouldLogInfo ? 'info' : 'debug']({
           trace_id: traceId,
           domain,
           module: 'whois-worker',
@@ -116,8 +118,7 @@ export class WhoisWorker {
         skipAi: true,
       });
 
-      const previous = await this.sites.getByDomain(domain);
-      await this.sites.upsert(mergeSiteReports(previous, report));
+      await this.sites.upsert(report, { previousReport: previous });
 
       const whoisProvider = this.resolveWhoisProviderResult(report);
       const previousWhoisErrorCount = target?.whoisErrorCount ?? 0;

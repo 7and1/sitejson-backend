@@ -1,11 +1,9 @@
-import { randomUUID } from 'node:crypto';
 import { createInterface } from 'node:readline';
 import { Readable } from 'node:stream';
 import type { RadarSnapshot } from '../core/types.js';
 import type { Logger } from '../observability/logger.js';
 import { fetchWithRetry } from '../providers/http.js';
 import type { JobQueue, QueueJobPayload } from '../queue/interfaces.js';
-import { QUEUE_NAMES } from '../queue/names.js';
 import type { CrawlTargetRepository, JobRepository, RadarSnapshotRepository } from '../storage/interfaces.js';
 
 type RadarDomainResponse = {
@@ -59,6 +57,9 @@ const toRankBucket = (rank: number | null | undefined): string | undefined => {
   if (rank <= 100000) return 'Top 100k';
   return 'Global';
 };
+
+const HIGH_VALUE_RANK_LIMIT = 100_000;
+const FIRST_RUN_CANDIDATE_RANK_LIMIT = 1_000_000;
 
 const normalizeCsvCell = (value: string): string => {
   const trimmed = value.trim();
@@ -200,6 +201,7 @@ export class RadarSyncWorker {
     private readonly retryAttempts: number = 2,
     private readonly retryBaseMs: number = 250,
     private readonly bulkBatchSize: number = 10_000,
+    private readonly bulkMinValidRows: number = 1_000_000,
   ) {}
 
   async process(payload: QueueJobPayload): Promise<void> {
@@ -296,6 +298,7 @@ export class RadarSyncWorker {
         event: 'snapshot_update_failed',
         error: error instanceof Error ? error.message : String(error),
       });
+      throw error;
     }
   }
 
@@ -315,6 +318,7 @@ export class RadarSyncWorker {
       event: 'bulk_csv_started',
       dataset_type: this.datasetType,
       batch_size: this.bulkBatchSize,
+      min_valid_rows: this.bulkMinValidRows,
     });
 
     try {
@@ -334,13 +338,7 @@ export class RadarSyncWorker {
       });
 
       if (!response.ok || !response.body) {
-        this.logger.error({
-          trace_id: traceId,
-          module: 'radar-sync-worker',
-          event: 'bulk_csv_download_failed',
-          status: response.status,
-        });
-        return;
+        throw new Error(`RADAR_BULK_CSV_DOWNLOAD_FAILED_${response.status}`);
       }
 
       const parseState: CsvParseState = {
@@ -395,6 +393,18 @@ export class RadarSyncWorker {
         totalProcessed += batch.length;
       }
 
+      if (this.bulkMinValidRows > 0 && parseState.validRows < this.bulkMinValidRows) {
+        this.logger.warn({
+          trace_id: traceId,
+          module: 'radar-sync-worker',
+          event: 'bulk_csv_scope_below_expectation',
+          valid_rows: parseState.validRows,
+          min_valid_rows: this.bulkMinValidRows,
+          dataset_type: this.datasetType,
+          parse_mode: parseState.mode ?? 'domain_only',
+        });
+      }
+
       this.logger.info({
         trace_id: traceId,
         module: 'radar-sync-worker',
@@ -415,6 +425,7 @@ export class RadarSyncWorker {
         event: 'bulk_csv_failed',
         error: error instanceof Error ? error.message : String(error),
       });
+      throw error;
     }
   }
 
@@ -493,7 +504,7 @@ export class RadarSyncWorker {
         event: 'dataset_url_fetch_failed',
         error: error instanceof Error ? error.message : String(error),
       });
-      return null;
+      throw error;
     }
   }
 
@@ -510,23 +521,14 @@ export class RadarSyncWorker {
     const domains = normalizedBatch.map((item) => item.domain);
     const existingDomains = await this.crawlTargets.getExistingDomains(domains);
 
+    await this.crawlTargets.bulkUpsert(normalizedBatch.map((item) => ({
+      domain: item.domain,
+      priority: item.rank <= HIGH_VALUE_RANK_LIMIT ? 2 : 1,
+      isHighValue: item.rank <= HIGH_VALUE_RANK_LIMIT,
+      radarRank: item.rank,
+    })));
+
     const newDomains = normalizedBatch.filter((item) => !existingDomains.has(item.domain));
-    const existingDomainRanks = normalizedBatch.filter((item) => existingDomains.has(item.domain));
-
-    if (newDomains.length > 0) {
-      await this.crawlTargets.bulkUpsert(newDomains.map((item) => ({
-        domain: item.domain,
-        priority: item.rank <= 100_000 ? 2 : 1,
-        radarRank: item.rank,
-      })));
-    }
-
-    if (existingDomainRanks.length > 0) {
-      await this.crawlTargets.bulkUpdateRadarRank(existingDomainRanks.map((item) => ({
-        domain: item.domain,
-        radarRank: item.rank,
-      })));
-    }
 
     const now = new Date().toISOString();
     const snapshots: RadarSnapshot[] = normalizedBatch.map((item) => ({
@@ -539,26 +541,15 @@ export class RadarSyncWorker {
     }));
     await this.radarSnapshots.bulkUpsert(snapshots);
 
-    if (newDomains.length > 0) {
-      const browserPayloads: QueueJobPayload[] = newDomains
-        .filter((item) => item.rank <= 1_000_000)
-        .map((item) => ({
-          jobId: randomUUID(),
-          domain: item.domain,
-          traceId,
-          source: 'system',
-          dispatchLane: 'background',
-          phase: QUEUE_NAMES.browser,
-          purpose: 'browser',
-          isHighValue: item.rank <= 100_000,
-        }));
-
-      if (browserPayloads.length > 0) {
-        await this.queue.enqueueBulk(browserPayloads, QUEUE_NAMES.browser);
-        await Promise.allSettled(
-          browserPayloads.map((item) => this.crawlTargets.update(item.domain, { lastBrowserStatus: 'pending' })),
-        );
-      }
+    const firstRunCandidates = newDomains.filter((item) => item.rank <= FIRST_RUN_CANDIDATE_RANK_LIMIT).length;
+    if (firstRunCandidates > 0) {
+      this.logger.info({
+        trace_id: traceId,
+        module: 'radar-sync-worker',
+        event: 'bulk_csv_first_run_candidates_recorded',
+        count: firstRunCandidates,
+        max_rank: FIRST_RUN_CANDIDATE_RANK_LIMIT,
+      });
     }
 
     return newDomains.length;

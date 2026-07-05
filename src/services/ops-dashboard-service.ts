@@ -41,6 +41,13 @@ export interface OpsDashboardResponse {
     error_message?: string;
   }>;
   generated_at: string;
+  alerts: Array<{
+    code: 'QUEUE_FAILED_JOBS';
+    severity: 'warning';
+    queue: string;
+    failed: number;
+    message: string;
+  }>;
   queue_by_type?: Record<string, {
     waiting: number;
     active: number;
@@ -112,6 +119,19 @@ const aggregateQueueCounts = (entries: Iterable<QueueCounts>): QueueCounts => {
   return totals;
 };
 
+export const buildQueueFailureAlerts = (queueByType: Record<string, QueueCounts>) => {
+  return Object.entries(queueByType)
+    .filter(([, counts]) => counts.failed > 0)
+    .sort((left, right) => right[1].failed - left[1].failed || left[0].localeCompare(right[0]))
+    .map(([queueName, counts]) => ({
+      code: 'QUEUE_FAILED_JOBS' as const,
+      severity: 'warning' as const,
+      queue: queueName,
+      failed: counts.failed,
+      message: `Queue ${queueName} has ${counts.failed} failed job${counts.failed === 1 ? '' : 's'} awaiting review or retry.`,
+    }));
+};
+
 export class OpsDashboardService {
   constructor(
     private readonly jobs: JobRepository,
@@ -143,6 +163,7 @@ export class OpsDashboardService {
       quality: normalizeQuality(stats),
       recent_items: recent.map(normalizeRecentItem),
       generated_at: new Date().toISOString(),
+      alerts: buildQueueFailureAlerts(queueByType),
       queue_by_type: queueByType,
     };
   }

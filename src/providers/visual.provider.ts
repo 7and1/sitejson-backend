@@ -3,6 +3,7 @@ import type { CrawlContext } from '../core/types.js';
 import { providerFailure, providerSuccess } from './base.js';
 import type { Provider } from './base.js';
 import type { VisualData } from './types.js';
+import { looksBlocked } from './anti-bot.js';
 import { ScreenshotStorage } from '../lib/screenshot-storage.js';
 import { parseHtmlSignals } from './html.js';
 import type { Logger } from 'pino';
@@ -125,8 +126,8 @@ export class VisualProvider implements Provider<VisualData> {
         });
       }
 
-      // 3. Fallback: SOAX screenshot (skip for unreachable domains AND when ProxyGrid already failed)
-      if (!screenshotBuffer && !ctx.metadata?.unreachable && !proxyGridAttempted && this.soax?.apiUrl && this.soax?.secret) {
+      // 3. Fallback: SOAX screenshot (skip only for unreachable domains)
+      if (!screenshotBuffer && !ctx.metadata?.unreachable && this.soax?.apiUrl && this.soax?.secret) {
         const soaxStart = Date.now();
         const soaxResult = await this.fetchSoax(ctx.url);
         screenshotBuffer = soaxResult?.screenshot ?? null;
@@ -140,10 +141,14 @@ export class VisualProvider implements Provider<VisualData> {
           latencyMs: Date.now() - soaxStart,
         });
 
-        if (soaxResult?.html && !ctx.html) {
-          ctx.html = soaxResult.html;
-          ctx.htmlSignals = parseHtmlSignals(soaxResult.html);
-          ctx.metadata = { ...ctx.metadata, htmlSource: 'soax' };
+        if (soaxResult?.html && !ctx.html && !ctx.metadata?.blocked) {
+          if (looksBlocked(200, soaxResult.html)) {
+            ctx.metadata = { ...ctx.metadata, htmlSource: 'soax', blocked: true };
+          } else {
+            ctx.html = soaxResult.html;
+            ctx.htmlSignals = parseHtmlSignals(soaxResult.html);
+            ctx.metadata = { ...ctx.metadata, htmlSource: 'soax', blocked: false };
+          }
         }
       }
 

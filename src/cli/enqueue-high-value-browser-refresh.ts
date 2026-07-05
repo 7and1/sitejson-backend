@@ -2,106 +2,105 @@ import { loadEnv } from '../config/env.js';
 import { BullMqJobQueue, parseRedisUrl } from '../queue/bullmq.js';
 import { QUEUE_NAMES } from '../queue/names.js';
 import type { QueueJobPayload } from '../queue/interfaces.js';
-import { createPostgresPool } from '../storage/postgres.js';
+import { createPostgresPool, PostgresCrawlTargetRepository } from '../storage/postgres.js';
 
 interface EnqueueOptions {
-  dryRun: boolean;
+  apply: boolean;
   batchSize: number;
   limit: number;
-  runTag: string;
-  minRank: number | null;
   maxRank: number;
-  spreadDays: number;
+  maxQueueDepth: number;
+  dailyBudget: number;
+  refreshTtlHours: number;
+  runTag: string;
 }
+
+const parsePositiveInt = (value: string | undefined): number | null => {
+  const parsed = Number.parseInt(value ?? '', 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+};
+
+const parseNonNegativeInt = (value: string | undefined): number | null => {
+  const parsed = Number.parseInt(value ?? '', 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+};
 
 const parseArgs = (): EnqueueOptions => {
   const options: EnqueueOptions = {
-    dryRun: false,
-    batchSize: 500,
-    limit: 10_000,
-    runTag: String(Date.now()),
-    minRank: null,
+    apply: false,
+    batchSize: 250,
+    limit: 500,
     maxRank: 100_000,
-    spreadDays: 0,
+    maxQueueDepth: 5_000,
+    dailyBudget: 10_000,
+    refreshTtlHours: 720,
+    runTag: String(Date.now()),
   };
 
   for (const arg of process.argv.slice(2)) {
+    if (arg === '--apply') {
+      options.apply = true;
+      continue;
+    }
+
     if (arg === '--dry-run') {
-      options.dryRun = true;
+      options.apply = false;
       continue;
     }
 
     if (arg.startsWith('--batch=')) {
-      const value = Number.parseInt(arg.split('=')[1] ?? '', 10);
-      if (Number.isFinite(value) && value > 0) options.batchSize = value;
+      options.batchSize = parsePositiveInt(arg.split('=')[1]) ?? options.batchSize;
+      continue;
+    }
+
+    if (arg.startsWith('--batch-size=')) {
+      options.batchSize = parsePositiveInt(arg.split('=')[1]) ?? options.batchSize;
       continue;
     }
 
     if (arg.startsWith('--limit=')) {
-      const value = Number.parseInt(arg.split('=')[1] ?? '', 10);
-      if (Number.isFinite(value) && value > 0) options.limit = value;
+      options.limit = parsePositiveInt(arg.split('=')[1]) ?? options.limit;
+      continue;
+    }
+
+    if (arg.startsWith('--max-rank=')) {
+      options.maxRank = parsePositiveInt(arg.split('=')[1]) ?? options.maxRank;
+      continue;
+    }
+
+    if (arg.startsWith('--max-queue-depth=')) {
+      options.maxQueueDepth = parseNonNegativeInt(arg.split('=')[1]) ?? options.maxQueueDepth;
+      continue;
+    }
+
+    if (arg.startsWith('--daily-budget=')) {
+      options.dailyBudget = parseNonNegativeInt(arg.split('=')[1]) ?? options.dailyBudget;
+      continue;
+    }
+
+    if (arg.startsWith('--refresh-ttl-hours=')) {
+      options.refreshTtlHours = parsePositiveInt(arg.split('=')[1]) ?? options.refreshTtlHours;
       continue;
     }
 
     if (arg.startsWith('--run-tag=')) {
       const value = (arg.split('=')[1] ?? '').trim();
-      if (value) options.runTag = value;
-      continue;
-    }
-
-    if (arg.startsWith('--min-rank=')) {
-      const value = Number.parseInt(arg.split('=')[1] ?? '', 10);
-      if (Number.isFinite(value) && value > 0) options.minRank = value;
-      continue;
-    }
-
-    if (arg.startsWith('--max-rank=')) {
-      const value = Number.parseInt(arg.split('=')[1] ?? '', 10);
-      if (Number.isFinite(value) && value >= 0) options.maxRank = value;
-      continue;
-    }
-
-    if (arg.startsWith('--spread-days=')) {
-      const value = Number.parseInt(arg.split('=')[1] ?? '', 10);
-      if (Number.isFinite(value) && value > 0) options.spreadDays = value;
-      continue;
+      if (value) {
+        options.runTag = value;
+      }
     }
   }
 
   return options;
 };
 
-const MAX_INT32 = 2147483647;
-const MS_PER_DAY = 86_400_000;
-
-const calculateDelayMs = (index: number, domainsPerDay: number): number => {
-  if (domainsPerDay <= 0) return 0;
-  const dayOffset = Math.floor(index / domainsPerDay);
-  const position = index % domainsPerDay;
-  const withinDayMs = Math.floor(((position + 0.5) / domainsPerDay) * MS_PER_DAY);
-  return dayOffset * MS_PER_DAY + withinDayMs;
-};
-
-const buildCandidateWhere = (options: EnqueueOptions) => {
-  const clauses: string[] = [];
-  const params: Array<number> = [];
-
-  clauses.push('ct.is_high_value = true');
-
-  if (options.maxRank > 0) {
-    params.push(options.maxRank);
-    if (options.minRank && options.minRank > 0) {
-      params.push(options.minRank);
-      clauses.push('(ct.radar_rank IS NOT NULL AND ct.radar_rank <= $1 AND ct.radar_rank >= $2)');
-    } else {
-      clauses.push('(ct.radar_rank IS NOT NULL AND ct.radar_rank <= $1)');
-    }
-  }
-
-  return {
-    where: `(${clauses.join(' OR ')})`,
-    params,
-  };
+const getGuardedQueueDepth = async (queue: BullMqJobQueue) => {
+  const [ingestCounts, browserCounts] = await Promise.all([
+    queue.getCounts(QUEUE_NAMES.ingest),
+    queue.getCounts(QUEUE_NAMES.browser),
+  ]);
+  return ingestCounts.waiting + ingestCounts.delayed + ingestCounts.prioritized
+    + browserCounts.waiting + browserCounts.delayed + browserCounts.prioritized;
 };
 
 const main = async () => {
@@ -116,99 +115,85 @@ const main = async () => {
   }
 
   const pool = createPostgresPool(env.DATABASE_URL);
+  const crawlTargets = new PostgresCrawlTargetRepository(pool);
   const queue = new BullMqJobQueue(
-    parseRedisUrl(env.REDIS_URL),
+    parseRedisUrl(env.REDIS_URL, env.REDIS_PASSWORD),
     env.QUEUE_NAME,
-    {},
+    { browser: env.QUEUE_CONCURRENCY_BROWSER, ingest: env.QUEUE_CONCURRENCY_INGEST },
     env.QUEUE_CONCURRENCY,
   );
 
-  const candidate = buildCandidateWhere(options);
-  const traceId = `trc_hv_browser_refresh_${options.runTag}`;
+  const claimOptions = {
+    maxRadarRank: options.maxRank,
+    refreshTtlHours: options.refreshTtlHours,
+  };
 
   try {
-    const countResult = await pool.query<{ count: string }>(
-      `SELECT COUNT(*)::text AS count
-       FROM crawl_targets ct
-       WHERE ${candidate.where}`,
-      candidate.params,
-    );
+    const candidateCount = await crawlTargets.countDueBrowserRefreshDomains(claimOptions);
+    const queueDepth = await getGuardedQueueDepth(queue);
+    const queueCapacity = Math.max(0, options.maxQueueDepth - queueDepth);
+    const maxByBudget = Math.min(options.limit, options.dailyBudget);
+    const wouldEnqueue = Math.min(candidateCount, maxByBudget, queueCapacity);
 
-    const totalCandidates = Number.parseInt(countResult.rows[0]?.count ?? '0', 10);
-    console.log(`High-value browser refresh candidates: ${totalCandidates}`);
+    console.log(`candidate_count=${candidateCount}`);
+    console.log(`background_queue_depth=${queueDepth}`);
+    console.log(`would_enqueue=${wouldEnqueue}`);
+    console.log(`dry_run=${!options.apply}`);
+    console.log(`max_rank=${options.maxRank}`);
+    console.log(`refresh_ttl_hours=${options.refreshTtlHours}`);
 
-    if (options.dryRun || totalCandidates === 0) {
+    if (!options.apply || wouldEnqueue <= 0) {
       return;
     }
 
-    const totalToEnqueue = Math.min(totalCandidates, options.limit);
-    const spreadDays = Math.max(0, Math.trunc(options.spreadDays));
-    const domainsPerDay = spreadDays > 0 ? Math.max(1, Math.ceil(totalToEnqueue / spreadDays)) : 0;
-
-    if (spreadDays > 0) {
-      console.log(`Spreading browser refresh jobs over ${spreadDays} days (${domainsPerDay} per day target).`);
-    }
-
+    const traceId = `trc_hv_browser_refresh_${options.runTag}`;
     let enqueued = 0;
-    let lastRankKey = 0;
-    let lastDomain = '';
 
-    while (enqueued < options.limit) {
-      const batchLimit = Math.min(options.batchSize, options.limit - enqueued);
-      if (batchLimit <= 0) break;
-
-      const rankParams = candidate.params;
-      const paginationParams: Array<number | string> = [...rankParams, lastRankKey, lastDomain, batchLimit];
-      const result = await pool.query<{ domain: string; is_high_value: boolean; radar_rank: number | null }>(
-        `
-        SELECT ct.domain, ct.is_high_value, ct.radar_rank
-        FROM crawl_targets ct
-        WHERE ${candidate.where}
-          AND (COALESCE(ct.radar_rank, ${MAX_INT32}), ct.domain) > ($${rankParams.length + 1}::int, $${rankParams.length + 2}::text)
-        ORDER BY COALESCE(ct.radar_rank, ${MAX_INT32}) ASC, ct.domain ASC
-        LIMIT $${rankParams.length + 3};
-        `,
-        paginationParams,
-      );
-
-      if (result.rowCount === 0) {
+    while (enqueued < maxByBudget) {
+      const currentDepth = await getGuardedQueueDepth(queue);
+      const remainingQueueCapacity = Math.max(0, options.maxQueueDepth - currentDepth);
+      if (remainingQueueCapacity <= 0) {
+        console.log('queue_depth_guard_reached=true');
         break;
       }
 
-      const payloads: QueueJobPayload[] = result.rows.map((row, idx) => {
-        const index = enqueued + idx;
-        const radarRank = typeof row.radar_rank === 'number' ? row.radar_rank : null;
-        const isHighValue = row.is_high_value || (typeof radarRank === 'number' && radarRank > 0 && radarRank <= 100_000);
-        const delayMs = domainsPerDay > 0 ? calculateDelayMs(index, domainsPerDay) : undefined;
+      const batchLimit = Math.min(
+        options.batchSize,
+        maxByBudget - enqueued,
+        remainingQueueCapacity,
+      );
+      if (batchLimit <= 0) {
+        break;
+      }
 
-        return {
-          jobId: `hv-browser-refresh-${options.runTag}-${row.domain}`,
-          domain: row.domain,
-          traceId,
-          source: 'system' as const,
-          dispatchLane: 'background' as const,
-          phase: QUEUE_NAMES.browser,
-          purpose: 'browser' as const,
-          priority: 'high' as const,
-          forceRefresh: true,
-          skipAi: true,
-          isHighValue,
-          ...(delayMs ? { delayMs } : {}),
-        };
-      });
+      const claimed = await crawlTargets.claimDueBrowserRefreshDomains(batchLimit, claimOptions);
+      if (claimed.length === 0) {
+        break;
+      }
 
-      await queue.enqueueBulk(payloads, QUEUE_NAMES.browser);
+      const payloads: QueueJobPayload[] = claimed.map((item) => ({
+        jobId: `hv-browser-refresh-${options.runTag}-${item.domain}`,
+        domain: item.domain,
+        traceId,
+        source: 'system',
+        dispatchLane: 'background',
+        phase: QUEUE_NAMES.browser,
+        purpose: 'browser',
+        priority: 'high',
+        forceRefresh: true,
+        skipAi: true,
+        isHighValue: item.isHighValue,
+      }));
+
+      try {
+        await queue.enqueueBulk(payloads, QUEUE_NAMES.browser);
+      } catch (error) {
+        await crawlTargets.releaseClaimedBrowserRefreshDomains(claimed);
+        throw error;
+      }
 
       enqueued += payloads.length;
-      const lastRow = result.rows[result.rows.length - 1];
-      lastRankKey = lastRow?.radar_rank ?? MAX_INT32;
-      lastDomain = lastRow?.domain ?? lastDomain;
-
-      console.log(`Enqueued ${enqueued} / ${totalToEnqueue} high-value browser refresh jobs`);
-
-      if (payloads.length < batchLimit) {
-        break;
-      }
+      console.log(`enqueued=${enqueued}`);
     }
   } finally {
     await queue.close();
@@ -217,6 +202,6 @@ const main = async () => {
 };
 
 main().catch((error) => {
-  console.error('Enqueue failed:', error);
+  console.error('High-value browser refresh enqueue failed:', error);
   process.exit(1);
 });

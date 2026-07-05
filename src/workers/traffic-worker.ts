@@ -5,9 +5,10 @@ import { QUEUE_NAMES } from '../queue/names.js';
 import type { SiteReport } from '../core/types.js';
 import type { CrawlTargetRepository, JobRepository, SiteRepository } from '../storage/interfaces.js';
 import type { Orchestrator } from '../core/orchestrator.js';
-import { mergeSiteReports } from '../services/report-merge.js';
 
 const HOUR_MS = 3_600_000;
+const MONTHLY_TRAFFIC_RADAR_RANK_LIMIT = 100_000;
+const REDIS_SEED_HARD_STOP_RATIO = 0.85;
 
 export class TrafficWorker {
   private skipCooldownCount = 0;
@@ -66,7 +67,7 @@ export class TrafficWorker {
   async process(payload: QueueJobPayload): Promise<void> {
     const { domain, traceId, crawlJobId } = payload;
 
-    // Handle monthly seed job: query top 100K and enqueue them
+    // Handle monthly seed job: query top 100K by Radar rank and enqueue them
     if (payload.purpose === 'traffic-monthly-seed') {
       await this.seedMonthlyTraffic(traceId);
       return;
@@ -79,14 +80,17 @@ export class TrafficWorker {
     }
 
     const now = new Date();
-    const target = await this.crawlTargets.getByDomain(domain);
+    const [previous, target] = await Promise.all([
+      this.sites.getByDomain(domain),
+      this.crawlTargets.getByDomain(domain),
+    ]);
 
     if (!payload.forceRefresh) {
       const nextTrafficAtMs = this.parseTimestamp(target?.nextTrafficAt);
       if (nextTrafficAtMs !== null && now.getTime() < nextTrafficAtMs) {
         this.skipCooldownCount += 1;
         const shouldLogInfo = this.skipCooldownCount <= 5 || this.skipCooldownCount % 1000 === 0;
-        (shouldLogInfo ? this.logger.info : this.logger.debug)({
+        this.logger[shouldLogInfo ? 'info' : 'debug']({
           trace_id: traceId,
           domain,
           module: 'traffic-worker',
@@ -109,8 +113,7 @@ export class TrafficWorker {
         skipAi: true,
       });
 
-      const previous = await this.sites.getByDomain(domain);
-      await this.sites.upsert(mergeSiteReports(previous, report));
+      await this.sites.upsert(report, { previousReport: previous });
 
       const trafficProvider = this.resolveTrafficProviderResult(report);
       const previousErrorCount = target?.errorCount ?? 0;
@@ -169,8 +172,28 @@ export class TrafficWorker {
   }
 
   private async seedMonthlyTraffic(traceId: string): Promise<void> {
-    const topDomains = await this.crawlTargets.getTopByRadarRank(100_000, {
+    const redisMemory = await this.queue.getRedisMemorySnapshot();
+    if (
+      redisMemory?.ratio != null
+      && redisMemory.maxBytes != null
+      && redisMemory.usedBytes != null
+      && redisMemory.ratio >= REDIS_SEED_HARD_STOP_RATIO
+    ) {
+      this.logger.warn({
+        trace_id: traceId,
+        module: 'traffic-worker',
+        event: 'monthly_seed_skipped_redis_memory',
+        redis_memory_ratio: redisMemory.ratio,
+        redis_used_bytes: redisMemory.usedBytes,
+        redis_max_bytes: redisMemory.maxBytes,
+        hard_stop_ratio: REDIS_SEED_HARD_STOP_RATIO,
+      });
+      return;
+    }
+
+    const topDomains = await this.crawlTargets.getTopByRadarRank(MONTHLY_TRAFFIC_RADAR_RANK_LIMIT, {
       dueOnly: true,
+      maxRadarRank: MONTHLY_TRAFFIC_RADAR_RANK_LIMIT,
     });
 
     if (topDomains.length === 0) {
@@ -189,7 +212,7 @@ export class TrafficWorker {
     const payloads: QueueJobPayload[] = topDomains.map((item, index) => {
       const dayOffset = Math.floor(index / domainsPerDay);
       return {
-        jobId: `traffic-monthly-${item.domain}-${Date.now()}`,
+        jobId: `traffic-monthly-${item.domain}`,
         domain: item.domain,
         traceId,
         source: 'system' as const,
@@ -229,7 +252,7 @@ export class TrafficWorker {
     }
 
     const payloads: QueueJobPayload[] = domains.map((domain) => ({
-      jobId: `traffic-fastlane-${domain}-${Date.now()}`,
+      jobId: `traffic-fastlane-${domain}`,
       domain,
       traceId,
       source: 'system' as const,

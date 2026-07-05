@@ -21,6 +21,7 @@ export type QueueJobPayload = {
   isHighValue?: boolean;
   delayMs?: number;
   screenshotUrl?: string;
+  webhookUrl?: string;
   purpose?:
     | 'analysis'
     | 'radar-sync'
@@ -45,6 +46,12 @@ export interface QueueCounts {
   prioritized: number;
 }
 
+export interface RedisMemorySnapshot {
+  usedBytes: number | null;
+  maxBytes: number | null;
+  ratio: number | null;
+}
+
 export type QueueCountsMap = Record<QueueName, QueueCounts>;
 
 export interface RepeatableJobOptions {
@@ -56,9 +63,11 @@ export interface JobQueue {
   enqueue(payload: QueueJobPayload, queueName?: QueueName): Promise<void>;
   enqueueBulk(payloads: QueueJobPayload[], queueName: QueueName): Promise<void>;
   addRepeatable(queueName: QueueName, options: RepeatableJobOptions): Promise<void>;
+  removeRepeatables(queueName: QueueName, purpose: QueueJobPayload['purpose']): Promise<number>;
   consume(queueName: QueueName, handler: (payload: QueueJobPayload) => Promise<void>): Promise<void>;
   getCounts(queueName?: QueueName): Promise<QueueCounts>;
   getAllCounts(): Promise<QueueCountsMap>;
+  getRedisMemorySnapshot(): Promise<RedisMemorySnapshot | null>;
   retryFailed(queueName: QueueName, limit: number): Promise<number>;
   healthCheck(): Promise<boolean>;
   close?(): Promise<void>;

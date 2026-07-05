@@ -13,6 +13,8 @@ const ACQUIRE_TIMEOUT_MS = 30_000;
 export class BrowserPool {
   private readonly pool: Browser[] = [];
   private readonly waiting: Waiter[] = [];
+  private readonly pendingCloses = new Set<Promise<void>>();
+  private readonly pendingOperations = new Set<Promise<void>>();
   private closed = false;
 
   constructor(
@@ -65,8 +67,24 @@ export class BrowserPool {
       // Browser disconnected, launch a replacement
       this.logger.warn({ module: 'browser-pool', event: 'replacing_disconnected_browser' });
       try {
-        return await chromium.launch({ headless: true });
+        const replacement = chromium.launch({ headless: true });
+        this.trackOperation(replacement.then(
+          async (fresh) => {
+            if (this.closed) {
+              await this.closeBrowser(fresh, 'close_acquire_replacement_after_shutdown_error');
+            }
+          },
+          () => undefined,
+        ));
+        const fresh = await replacement;
+        if (this.closed) {
+          throw new Error('BrowserPool is closed');
+        }
+        return fresh;
       } catch (err) {
+        if (this.closed && err instanceof Error && err.message === 'BrowserPool is closed') {
+          throw err;
+        }
         this.logger.error({
           module: 'browser-pool',
           event: 'replacement_launch_failed',
@@ -90,13 +108,7 @@ export class BrowserPool {
 
   release(browser: Browser): void {
     if (this.closed) {
-      browser.close().catch((err) => {
-        this.logger.debug({
-          module: 'browser-pool',
-          event: 'close_after_shutdown_error',
-          error: err instanceof Error ? err.message : String(err),
-        });
-      });
+      this.closeBrowser(browser, 'close_after_shutdown_error');
       return;
     }
 
@@ -106,9 +118,15 @@ export class BrowserPool {
       if (browser.isConnected()) {
         waiter.resolve(browser);
       } else {
-        // Replace disconnected browser before handing to waiter
-        chromium.launch({ headless: true }).then(
-          (fresh) => waiter.resolve(fresh),
+        const replacement = chromium.launch({ headless: true }).then(
+          async (fresh) => {
+            if (this.closed) {
+              await this.closeBrowser(fresh, 'close_replacement_after_shutdown_error');
+              waiter.reject(new Error('BrowserPool is closed'));
+              return;
+            }
+            waiter.resolve(fresh);
+          },
           (err) => {
             this.logger.error({
               module: 'browser-pool',
@@ -118,6 +136,7 @@ export class BrowserPool {
             waiter.reject(new Error('Failed to launch replacement browser'));
           },
         );
+        this.trackOperation(replacement);
       }
       return;
     }
@@ -127,12 +146,12 @@ export class BrowserPool {
     } else {
       // Replace disconnected browser asynchronously to maintain pool size
       this.logger.warn({ module: 'browser-pool', event: 'replacing_dropped_browser', poolSize: this.pool.length });
-      chromium.launch({ headless: true }).then(
-        (fresh) => {
+      const replacement = chromium.launch({ headless: true }).then(
+        async (fresh) => {
           if (!this.closed) {
             this.pool.push(fresh);
           } else {
-            fresh.close().catch(() => {});
+            await this.closeBrowser(fresh, 'close_background_replacement_after_shutdown_error');
           }
         },
         (err) => {
@@ -144,7 +163,32 @@ export class BrowserPool {
           });
         },
       );
+      this.trackOperation(replacement);
     }
+  }
+
+  private trackOperation(operation: Promise<void>): void {
+    this.pendingOperations.add(operation);
+    operation.finally(() => {
+      this.pendingOperations.delete(operation);
+    });
+  }
+
+  private closeBrowser(browser: Browser, errorEvent: string): Promise<void> {
+    const closePromise = browser.close()
+      .catch((err) => {
+        this.logger.debug({
+          module: 'browser-pool',
+          event: errorEvent,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+
+    this.pendingCloses.add(closePromise);
+    closePromise.finally(() => {
+      this.pendingCloses.delete(closePromise);
+    });
+    return closePromise;
   }
 
   async close(): Promise<void> {
@@ -159,6 +203,12 @@ export class BrowserPool {
 
     await Promise.allSettled(this.pool.map((b) => b.close()));
     this.pool.length = 0;
+    while (this.pendingOperations.size > 0 || this.pendingCloses.size > 0) {
+      await Promise.allSettled([
+        ...Array.from(this.pendingOperations),
+        ...Array.from(this.pendingCloses),
+      ]);
+    }
     this.logger.info({ module: 'browser-pool', event: 'closed' });
   }
 }

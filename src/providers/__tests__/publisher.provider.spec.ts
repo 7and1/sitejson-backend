@@ -1,13 +1,44 @@
+import { promises as dns } from 'node:dns';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { PublisherProvider } from '../publisher.provider.js';
+
+const undiciMock = vi.hoisted(() => ({
+  fetch: vi.fn(),
+  Agent: vi.fn((options?: Record<string, unknown>) => ({
+    options: options ?? {},
+    close: vi.fn().mockResolvedValue(undefined),
+  })),
+  ProxyAgent: vi.fn((proxyUrl: string) => ({
+    proxyUrl,
+    close: vi.fn().mockResolvedValue(undefined),
+  })),
+}));
+
+vi.mock('undici', () => ({
+  Agent: undiciMock.Agent,
+  ProxyAgent: undiciMock.ProxyAgent,
+  fetch: undiciMock.fetch,
+}));
+
+vi.mock('node:dns', () => ({
+  promises: {
+    resolve4: vi.fn(async () => ['93.184.216.34']),
+    resolve6: vi.fn(async () => []),
+  },
+}));
 
 describe('PublisherProvider', () => {
   afterEach(() => {
     vi.restoreAllMocks();
+    undiciMock.fetch.mockReset();
+    undiciMock.Agent.mockClear();
+    undiciMock.ProxyAgent.mockClear();
+    vi.mocked(dns.resolve4).mockResolvedValue(['93.184.216.34']);
+    vi.mocked(dns.resolve6).mockResolvedValue([]);
   });
 
   it('parses ads.txt systems', async () => {
-    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+    undiciMock.fetch.mockResolvedValue(
       new Response('google.com, pub-123, DIRECT\nappnexus.com, 9876, RESELLER', {
         status: 200,
       }),
@@ -30,7 +61,7 @@ describe('PublisherProvider', () => {
   });
 
   it('returns missing ads.txt gracefully', async () => {
-    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+    undiciMock.fetch.mockResolvedValue(
       new Response('not found', { status: 404 }),
     );
 
@@ -47,7 +78,7 @@ describe('PublisherProvider', () => {
   });
 
   it('treats empty ads.txt as missing', async () => {
-    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+    undiciMock.fetch.mockResolvedValue(
       new Response('', { status: 200 }),
     );
 
@@ -65,7 +96,7 @@ describe('PublisherProvider', () => {
   });
 
   it('keeps only valid domain tokens in adSystems', async () => {
-    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+    undiciMock.fetch.mockResolvedValue(
       new Response(
         [
           'google.com, pub-123, DIRECT',

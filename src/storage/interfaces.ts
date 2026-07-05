@@ -13,6 +13,13 @@ import type {
   TaxonomyTriggerReason,
 } from '../core/types.js';
 
+export interface BrowserRefreshClaim {
+  domain: string;
+  radarRank: number;
+  isHighValue: boolean;
+  previousBrowserStatus?: CrawlTarget['lastBrowserStatus'];
+}
+
 export interface TaxonomyData {
   iabCategory: string;
   iabSubCategory: string;
@@ -72,7 +79,7 @@ export interface CrawlTargetUpdatePatch {
   taxonomyPromptVersion?: number;
   taxonomyLastTriggerReason?: TaxonomyTriggerReason;
   taxonomySourceLane?: 'browser' | 'async';
-  lastContentHash?: string;
+  lastContentHash?: string | null;
   errorCount?: number;
   whoisErrorCount?: number;
 }
@@ -84,15 +91,25 @@ export interface TrafficRefreshOptions {
   spreadDays?: number;
 }
 
+export interface SiteUpsertOptions {
+  previousReport?: SiteReport | null;
+}
+
 export interface SiteRepository {
   getByDomain(domain: string): Promise<SiteReport | null>;
-  upsert(report: SiteReport): Promise<void>;
+  upsert(report: SiteReport, options?: SiteUpsertOptions): Promise<void>;
   searchDirectory(type: DirectoryType, slug: string, page: number, pageSize: number, options?: DirectorySearchOptions): Promise<DirectorySearchResult>;
   getDirectoryStats(type: DirectoryType, slug: string): Promise<DirectoryStats>;
   getDirectoryTypeSummary(type: DirectoryType, limit?: number): Promise<DirectoryTypeSummary>;
   getGlobalInsights(): Promise<GlobalInsights>;
   findAlternatives(domain: string, limit: number): Promise<AlternativeSearchResult | null>;
   healthCheck(): Promise<boolean>;
+  /**
+   * Best-effort warming of the directory facet/stats caches on startup, so the
+   * first requests after a (re)deploy don't all run the slow aggregations at
+   * once (which would otherwise produce a cold-start burst of timeouts).
+   */
+  prewarmDirectoryCaches(options?: { topSlugsPerType?: number }): Promise<void>;
 }
 
 export interface RadarSnapshotRepository {
@@ -113,6 +130,7 @@ export interface JobRepository {
   findRunningByDomain(domain: string): Promise<CrawlJob | null>;
   getDashboardJobStats(windowMs: number): Promise<DashboardJobStats>;
   getRecentDashboardJobs(windowMs: number, limit: number): Promise<DashboardRecentJobItem[]>;
+  releaseStaleActiveJobs(options?: { staleHours?: number; limit?: number }): Promise<number>;
   healthCheck(): Promise<boolean>;
 }
 
@@ -140,7 +158,7 @@ export interface CrawlTargetRepository {
   getDueBatch(limit: number, options?: TrafficRefreshOptions): Promise<CrawlTargetScheduleDue[]>;
   getTopByRadarRank(
     limit: number,
-    options?: { dueOnly?: boolean },
+    options?: { dueOnly?: boolean; maxRadarRank?: number },
   ): Promise<Array<{ domain: string; radarRank: number }>>;
   getFastlaneTrafficDomains(
     limit: number,
@@ -155,6 +173,17 @@ export interface CrawlTargetRepository {
     options?: { maxRadarRank?: number },
   ): Promise<Array<{ domain: string; radarRank: number; isHighValue: boolean }>>;
   releaseClaimedFirstRunDomains(domains: string[]): Promise<void>;
+  countDueBrowserRefreshDomains(
+    options?: { maxRadarRank?: number; refreshTtlHours?: number },
+  ): Promise<number>;
+  claimDueBrowserRefreshDomains(
+    limit: number,
+    options?: { maxRadarRank?: number; refreshTtlHours?: number },
+  ): Promise<BrowserRefreshClaim[]>;
+  releaseClaimedBrowserRefreshDomains(claims: BrowserRefreshClaim[]): Promise<void>;
+  releaseStaleBrowserPending(
+    options?: { staleHours?: number; limit?: number; maxRadarRank?: number },
+  ): Promise<number>;
   getBrowserSuccessTaxonomyMissingDomains(
     limit: number,
     options?: { maxRadarRank?: number; currentPromptVersion?: number },

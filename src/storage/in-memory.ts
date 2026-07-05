@@ -12,17 +12,20 @@ import type {
   SiteReport,
 } from '../core/types.js';
 import type {
+  BrowserRefreshClaim,
   CrawlTargetRepository,
   CrawlTargetScheduleDue,
   CrawlTargetUpdatePatch,
   JobRepository,
   RadarSnapshotRepository,
   SiteRepository,
+  SiteUpsertOptions,
   TrafficRefreshOptions,
 } from './interfaces.js';
-import { sanitizeSiteReport } from '../services/report-merge.js';
-import { calculateLegitimacyScore } from '../scoring/legitimacy.js';
+import { mergeSiteReports, sanitizeSiteReport } from '../services/report-merge.js';
+import { calculateLegitimacyScore, withCalculatedLegitimacyScore } from '../scoring/legitimacy.js';
 import { normalizeDirectoryList, normalizeDirectorySlug } from './directory-slug.js';
+import { buildSemanticTokens, toSemanticAlternativeItem } from './alternatives-ranking.js';
 
 const safeNumber = (value: number): number => {
   return Number.isFinite(value) ? value : 0;
@@ -46,6 +49,8 @@ const normalizeAlternativeList = (values: string[] | undefined): string[] => (
   normalizeList(values).filter(isHighSignalAlternativeSlug)
 );
 
+const DEFAULT_BROWSER_REFRESH_TTL_HOURS = 720;
+
 const categoryFromReport = (report: SiteReport): string | undefined => {
   const category = report.taxonomy?.iabCategory;
   if (!category) {
@@ -68,6 +73,27 @@ const rankForAlternatives = (report: SiteReport): number | undefined => {
 
   return Math.trunc(rank);
 };
+
+const tagsFromReport = (report: SiteReport): string[] => (
+  normalizeAlternativeList(report.taxonomy?.tags)
+);
+
+const techFromReport = (report: SiteReport): string[] => (
+  normalizeList(report.meta?.techStackDetected)
+);
+
+const semanticTokensFromReport = (report: SiteReport): string[] => (
+  buildSemanticTokens([
+    report.meta?.title,
+    report.meta?.description,
+    report.taxonomy?.iabCategory,
+    report.aiAnalysis?.business?.summary,
+    report.aiAnalysis?.business?.targetAudience,
+    report.aiAnalysis?.business?.model,
+    ...tagsFromReport(report),
+    ...techFromReport(report),
+  ])
+);
 
 const jaccardScore = (left: string[], right: string[]): number => {
   if (left.length === 0 && right.length === 0) {
@@ -190,11 +216,15 @@ export class InMemorySiteRepository implements SiteRepository {
 
   async getByDomain(domain: string): Promise<SiteReport | null> {
     const report = this.reports.get(domain);
-    return report ? sanitizeSiteReport(report) : null;
+    return report ? withCalculatedLegitimacyScore(sanitizeSiteReport(report)) : null;
   }
 
-  async upsert(report: SiteReport): Promise<void> {
-    const sanitizedReport = sanitizeSiteReport(report);
+  async upsert(report: SiteReport, options?: SiteUpsertOptions): Promise<void> {
+    const sanitizedIncoming = sanitizeSiteReport(report);
+    const previous = Object.prototype.hasOwnProperty.call(options ?? {}, 'previousReport')
+      ? options?.previousReport ?? null
+      : this.reports.get(sanitizedIncoming.domain) ?? null;
+    const sanitizedReport = withCalculatedLegitimacyScore(mergeSiteReports(previous, sanitizedIncoming));
     this.reports.set(sanitizedReport.domain, sanitizedReport);
 
     const prefix = `${sanitizedReport.domain}:`;
@@ -389,11 +419,14 @@ export class InMemorySiteRepository implements SiteRepository {
       return null;
     }
 
-    const targetCategory = categoryFromReport(target);
-    const targetRank = rankForAlternatives(target);
-    const targetTrafficRank = trafficRankFromReport(target);
-    const targetTags = normalizeAlternativeList(target.taxonomy?.tags);
-    const targetTech = normalizeList(target.meta?.techStackDetected);
+    const targetSignals = {
+      category: categoryFromReport(target) ?? null,
+      rank: rankForAlternatives(target) ?? null,
+      trafficRank: trafficRankFromReport(target) ?? null,
+      tags: tagsFromReport(target),
+      tech: techFromReport(target),
+      semanticTokens: semanticTokensFromReport(target),
+    };
 
     const safeLimit = Math.max(1, Math.min(20, Math.trunc(limit)));
     const cacheKey = `${domain}:${safeLimit}:${target.updatedAt}`;
@@ -409,9 +442,9 @@ export class InMemorySiteRepository implements SiteRepository {
     }
 
     // Need at least one signal to find alternatives
-    if (!targetCategory && targetTags.length === 0 && !targetRank && !targetTrafficRank) {
+    if (!targetSignals.category && targetSignals.tags.length === 0 && !targetSignals.rank && !targetSignals.trafficRank) {
       const emptyResult: AlternativeSearchResult = {
-        algorithm: 'rule_based',
+        algorithm: 'semantic_embedding',
         items: [],
       };
       this.alternativesCache.set(cacheKey, {
@@ -422,10 +455,10 @@ export class InMemorySiteRepository implements SiteRepository {
     }
 
     // Rank band boundaries (0.1x – 10x)
-    const minRadarRank = targetRank ? Math.max(1, Math.floor(targetRank * 0.1)) : null;
-    const maxRadarRank = targetRank ? Math.ceil(targetRank * 10) : null;
-    const minTrafficRank = targetTrafficRank ? Math.max(1, Math.floor(targetTrafficRank * 0.1)) : null;
-    const maxTrafficRank = targetTrafficRank ? Math.ceil(targetTrafficRank * 10) : null;
+    const minRadarRank = targetSignals.rank ? Math.max(1, Math.floor(targetSignals.rank * 0.1)) : null;
+    const maxRadarRank = targetSignals.rank ? Math.ceil(targetSignals.rank * 10) : null;
+    const minTrafficRank = targetSignals.trafficRank ? Math.max(1, Math.floor(targetSignals.trafficRank * 0.1)) : null;
+    const maxTrafficRank = targetSignals.trafficRank ? Math.ceil(targetSignals.trafficRank * 10) : null;
 
     // Multi-tier candidate selection: category OR tag/tech overlap OR rank proximity
     const candidateSet = new Set<string>();
@@ -443,21 +476,26 @@ export class InMemorySiteRepository implements SiteRepository {
       const candidateCategory = categoryFromReport(candidate);
       const candidateRank = rankForAlternatives(candidate);
       const candidateTrafficRank = trafficRankFromReport(candidate);
-      const candidateTags = normalizeAlternativeList(candidate.taxonomy?.tags);
-      const candidateTech = normalizeList(candidate.meta?.techStackDetected);
+      const candidateTags = tagsFromReport(candidate);
+      const candidateTech = techFromReport(candidate);
+      const candidateSemanticTokens = semanticTokensFromReport(candidate);
 
       // Tier 1: Same category
-      if (targetCategory && candidateCategory === targetCategory) {
+      if (targetSignals.category && candidateCategory === targetSignals.category) {
         addCandidate(candidate);
         continue;
       }
 
       // Tier 2: Tag or tech overlap
-      if (targetTags.length > 0 && candidateTags.some((t) => targetTags.includes(t))) {
+      if (targetSignals.tags.length > 0 && candidateTags.some((t) => targetSignals.tags.includes(t))) {
         addCandidate(candidate);
         continue;
       }
-      if (targetTech.length > 0 && candidateTech.some((t) => targetTech.includes(t))) {
+      if (targetSignals.tech.length > 0 && candidateTech.some((t) => targetSignals.tech.includes(t))) {
+        addCandidate(candidate);
+        continue;
+      }
+      if (candidateSemanticTokens.some((token) => targetSignals.semanticTokens.includes(token))) {
         addCandidate(candidate);
         continue;
       }
@@ -476,55 +514,18 @@ export class InMemorySiteRepository implements SiteRepository {
 
     const items = candidates
       .map((candidate) => {
-        const candidateCategory = categoryFromReport(candidate);
-        const candidateRank = rankForAlternatives(candidate);
-        const candidateTrafficRank = trafficRankFromReport(candidate);
-        const candidateTags = normalizeAlternativeList(candidate.taxonomy?.tags);
-        const candidateTech = normalizeList(candidate.meta?.techStackDetected);
-
-        const tagJaccard = jaccardScore(targetTags, candidateTags);
-        const techJaccard = jaccardScore(targetTech, candidateTech);
-        const catMatch = (targetCategory && candidateCategory === targetCategory) ? 1.0 : 0.0;
-
-        // Radar rank proximity
-        const radarProx = (targetRank && candidateRank && candidateRank > 0)
-          ? rankProximityScore(targetRank, candidateRank) : null;
-
-        // Traffic rank proximity
-        const trafficProx = (targetTrafficRank && candidateTrafficRank && candidateTrafficRank > 0)
-          ? rankProximityScore(targetTrafficRank, candidateTrafficRank) : null;
-
-        // Compute weighted score with dynamic redistribution
-        let rankComponent: number;
-        if (radarProx !== null && trafficProx !== null) {
-          rankComponent = 0.20 * radarProx + 0.20 * trafficProx;
-        } else if (radarProx !== null) {
-          rankComponent = 0.40 * radarProx;
-        } else if (trafficProx !== null) {
-          rankComponent = 0.40 * trafficProx;
-        } else {
-          // Redistribute to tags
-          rankComponent = 0.25 * tagJaccard;
-        }
-
-        const score = 0.20 * catMatch + 0.25 * tagJaccard + rankComponent + 0.15 * techJaccard;
-
-        const reasons: string[] = [];
-        if (catMatch > 0) reasons.push('same_category');
-        if (radarProx !== null) reasons.push('similar_rank_band');
-        if (trafficProx !== null) reasons.push('similar_traffic_rank');
-        if (tagJaccard > 0) reasons.push('high_tag_overlap');
-        if (techJaccard > 0) reasons.push('shared_tech_stack');
-
-        const displayRank = candidateRank ?? 0;
-
-        return {
+        return toSemanticAlternativeItem(targetSignals, {
           domain: candidate.domain,
           title: candidate.meta?.title ?? candidate.domain,
-          rank: displayRank,
-          score: Number.parseFloat(score.toFixed(6)),
-          reasons,
-        };
+          rank: rankForAlternatives(candidate) ?? null,
+          trafficRank: trafficRankFromReport(candidate) ?? null,
+          categoryText: categoryFromReport(candidate) ?? null,
+          tags: tagsFromReport(candidate),
+          tech: techFromReport(candidate),
+          description: candidate.meta?.description ?? null,
+          businessSummary: candidate.aiAnalysis?.business?.summary ?? null,
+          semanticTokens: semanticTokensFromReport(candidate),
+        });
       })
       .sort((left, right) => {
         if (right.score !== left.score) {
@@ -535,7 +536,7 @@ export class InMemorySiteRepository implements SiteRepository {
       .slice(0, safeLimit);
 
     const alternativesResult: AlternativeSearchResult = {
-      algorithm: 'rule_based',
+      algorithm: 'semantic_embedding',
       items,
     };
     this.alternativesCache.set(cacheKey, {
@@ -547,6 +548,10 @@ export class InMemorySiteRepository implements SiteRepository {
 
   async healthCheck(): Promise<boolean> {
     return true;
+  }
+
+  async prewarmDirectoryCaches(): Promise<void> {
+    // In-memory queries are already fast; nothing to warm.
   }
 }
 
@@ -728,6 +733,39 @@ export class InMemoryJobRepository implements JobRepository {
     return items;
   }
 
+  async releaseStaleActiveJobs(options?: { staleHours?: number; limit?: number }): Promise<number> {
+    const staleHours = Math.max(1, Math.trunc(options?.staleHours ?? 2));
+    const safeLimit = Math.max(1, Math.trunc(options?.limit ?? 5_000));
+    const cutoffMs = Date.now() - staleHours * 3600_000;
+    let released = 0;
+
+    for (const job of this.jobs.values()) {
+      if (released >= safeLimit) {
+        break;
+      }
+
+      if (job.status !== 'pending' && job.status !== 'running') {
+        continue;
+      }
+
+      const updatedAtMs = new Date(job.updatedAt).getTime();
+      if (!Number.isFinite(updatedAtMs) || updatedAtMs >= cutoffMs) {
+        continue;
+      }
+
+      this.jobs.set(job.id, {
+        ...job,
+        status: 'failed',
+        stage: 'stale_active_reaped',
+        errorMessage: `Released stale active job after ${staleHours}h`,
+        updatedAt: nowIso(),
+      });
+      released += 1;
+    }
+
+    return released;
+  }
+
   async healthCheck(): Promise<boolean> {
     return true;
   }
@@ -735,6 +773,15 @@ export class InMemoryJobRepository implements JobRepository {
 
 export class InMemoryCrawlTargetRepository implements CrawlTargetRepository {
   private readonly targets = new Map<string, CrawlTarget>();
+
+  private async ensureExists(domain: string, options?: { priority?: number; isHighValue?: boolean }): Promise<CrawlTarget> {
+    const existing = this.targets.get(domain);
+    if (existing) {
+      return existing;
+    }
+
+    return this.upsert(domain, options);
+  }
 
   async upsert(domain: string, options?: { priority?: number; isHighValue?: boolean }): Promise<CrawlTarget> {
     const existing = this.targets.get(domain);
@@ -821,7 +868,7 @@ export class InMemoryCrawlTargetRepository implements CrawlTargetRepository {
     status: CrawlTarget['lastBrowserStatus'],
     options?: { ttlSec?: number; errorBackoffSec?: number },
   ): Promise<void> {
-    const target = await this.upsert(domain);
+    const target = await this.ensureExists(domain);
     const now = nowIso();
     const errorBackoffSec = options?.errorBackoffSec ?? 24 * 3600;
 
@@ -863,17 +910,21 @@ export class InMemoryCrawlTargetRepository implements CrawlTargetRepository {
   }
 
   async update(domain: string, patch: CrawlTargetUpdatePatch): Promise<void> {
-    const current = await this.upsert(domain);
+    const current = await this.ensureExists(domain);
+    const normalizedPatch: CrawlTargetUpdatePatch = { ...patch };
+    if (Object.prototype.hasOwnProperty.call(normalizedPatch, 'lastContentHash') && normalizedPatch.lastContentHash === null) {
+      normalizedPatch.lastContentHash = undefined;
+    }
     const next: CrawlTarget = {
       ...current,
-      ...patch,
+      ...normalizedPatch,
       updatedAt: nowIso(),
     };
     this.targets.set(domain, next);
   }
 
   async evaluateDue(domain: string, options?: TrafficRefreshOptions): Promise<CrawlTargetScheduleDue> {
-    const target = await this.upsert(domain);
+    const target = await this.ensureExists(domain);
     const forceRefresh = options?.forceRefresh ?? false;
 
     return {
@@ -908,12 +959,14 @@ export class InMemoryCrawlTargetRepository implements CrawlTargetRepository {
 
   async getTopByRadarRank(
     limit: number,
-    options?: { dueOnly?: boolean },
+    options?: { dueOnly?: boolean; maxRadarRank?: number },
   ): Promise<Array<{ domain: string; radarRank: number }>> {
     const safeLimit = Math.max(1, Math.trunc(limit));
     const dueOnly = options?.dueOnly ?? false;
+    const maxRadarRank = options?.maxRadarRank ? Math.max(1, Math.trunc(options.maxRadarRank)) : undefined;
     return Array.from(this.targets.values())
       .filter((t) => typeof t.radarRank === 'number' && (!dueOnly || isDue(t.nextTrafficAt)))
+      .filter((t) => maxRadarRank === undefined || t.radarRank! <= maxRadarRank)
       .sort((a, b) => (a.radarRank ?? Infinity) - (b.radarRank ?? Infinity))
       .slice(0, safeLimit)
       .map((t) => ({ domain: t.domain, radarRank: t.radarRank! }));
@@ -959,7 +1012,7 @@ export class InMemoryCrawlTargetRepository implements CrawlTargetRepository {
     options?: { maxRadarRank?: number },
   ): Promise<Array<{ domain: string; radarRank: number; isHighValue: boolean }>> {
     const safeLimit = Math.max(1, Math.trunc(limit));
-    const maxRadarRank = Math.max(1, Math.trunc(options?.maxRadarRank ?? 100_000));
+    const maxRadarRank = Math.max(1, Math.trunc(options?.maxRadarRank ?? 1_000_000));
 
     return Array.from(this.targets.values())
       .filter((target) => typeof target.radarRank === 'number' && target.radarRank > 0 && target.radarRank <= maxRadarRank)
@@ -1018,6 +1071,118 @@ export class InMemoryCrawlTargetRepository implements CrawlTargetRepository {
       target.updatedAt = updatedAt;
       this.targets.set(domain, target);
     }
+  }
+
+  async countDueBrowserRefreshDomains(
+    options?: { maxRadarRank?: number; refreshTtlHours?: number },
+  ): Promise<number> {
+    return this.getDueBrowserRefreshCandidates(Number.POSITIVE_INFINITY, options).length;
+  }
+
+  async claimDueBrowserRefreshDomains(
+    limit: number,
+    options?: { maxRadarRank?: number; refreshTtlHours?: number },
+  ): Promise<BrowserRefreshClaim[]> {
+    const candidates = this.getDueBrowserRefreshCandidates(limit, options);
+    const updatedAt = nowIso();
+
+    for (const candidate of candidates) {
+      const target = this.targets.get(candidate.domain);
+      if (!target || target.lastBrowserStatus === 'pending' || target.lastBrowserStatus === 'running') {
+        continue;
+      }
+      target.lastBrowserStatus = 'pending';
+      target.updatedAt = updatedAt;
+      this.targets.set(candidate.domain, target);
+    }
+
+    return candidates;
+  }
+
+  async releaseClaimedBrowserRefreshDomains(claims: BrowserRefreshClaim[]): Promise<void> {
+    if (claims.length === 0) {
+      return;
+    }
+
+    const updatedAt = nowIso();
+    for (const claim of claims) {
+      const target = this.targets.get(claim.domain);
+      if (!target || target.lastBrowserStatus !== 'pending') {
+        continue;
+      }
+      target.lastBrowserStatus = claim.previousBrowserStatus;
+      target.updatedAt = updatedAt;
+      this.targets.set(claim.domain, target);
+    }
+  }
+
+  private getDueBrowserRefreshCandidates(
+    limit: number,
+    options?: { maxRadarRank?: number; refreshTtlHours?: number },
+  ): BrowserRefreshClaim[] {
+    const safeLimit = Math.max(1, Math.trunc(limit));
+    const maxRadarRank = Math.max(1, Math.trunc(options?.maxRadarRank ?? 100_000));
+    const refreshTtlHours = Math.max(1, Math.trunc(options?.refreshTtlHours ?? DEFAULT_BROWSER_REFRESH_TTL_HOURS));
+    const refreshCutoffMs = Date.now() - refreshTtlHours * 3600_000;
+
+    return Array.from(this.targets.values())
+      .filter((target) => typeof target.radarRank === 'number' && target.radarRank > 0 && target.radarRank <= maxRadarRank)
+      .filter((target) => target.lastBrowserStatus !== 'pending' && target.lastBrowserStatus !== 'running')
+      .filter((target) => isDue(target.nextBrowserAt))
+      .filter((target) => {
+        if (!target.lastBrowserAt) {
+          return true;
+        }
+        const lastBrowserAtMs = Date.parse(target.lastBrowserAt);
+        return Number.isFinite(lastBrowserAtMs) && lastBrowserAtMs <= refreshCutoffMs;
+      })
+      .sort((left, right) => {
+        const leftRank = left.radarRank ?? Number.POSITIVE_INFINITY;
+        const rightRank = right.radarRank ?? Number.POSITIVE_INFINITY;
+        if (leftRank !== rightRank) {
+          return leftRank - rightRank;
+        }
+        return right.priority - left.priority;
+      })
+      .slice(0, safeLimit)
+      .map((target) => ({
+        domain: target.domain,
+        radarRank: target.radarRank!,
+        isHighValue: target.isHighValue || target.radarRank! <= 100_000,
+        previousBrowserStatus: target.lastBrowserStatus,
+      }));
+  }
+
+  async releaseStaleBrowserPending(
+    options?: { staleHours?: number; limit?: number; maxRadarRank?: number },
+  ): Promise<number> {
+    const staleHours = Math.max(1, Math.trunc(options?.staleHours ?? 24));
+    const safeLimit = Math.max(1, Math.trunc(options?.limit ?? 5_000));
+    const maxRadarRank = options?.maxRadarRank ? Math.max(1, Math.trunc(options.maxRadarRank)) : null;
+    const staleBeforeMs = Date.now() - staleHours * 60 * 60 * 1000;
+
+    const candidates = Array.from(this.targets.values())
+      .filter((target) => target.lastBrowserStatus === 'pending')
+      .filter((target) => Date.parse(target.updatedAt) < staleBeforeMs)
+      .filter((target) => maxRadarRank == null || (typeof target.radarRank === 'number' && target.radarRank > 0 && target.radarRank <= maxRadarRank))
+      .sort((left, right) => {
+        const leftRank = left.radarRank ?? Number.POSITIVE_INFINITY;
+        const rightRank = right.radarRank ?? Number.POSITIVE_INFINITY;
+        if (leftRank !== rightRank) {
+          return leftRank - rightRank;
+        }
+        return Date.parse(left.updatedAt) - Date.parse(right.updatedAt);
+      })
+      .slice(0, safeLimit);
+
+    const updatedAt = nowIso();
+    for (const target of candidates) {
+      target.lastBrowserStatus = target.lastBrowserAt ? 'success' : undefined;
+      target.updatedAt = updatedAt;
+      this.targets.set(target.domain, target);
+    }
+
+    return candidates.length;
   }
 
   async getBrowserSuccessTaxonomyMissingDomains(

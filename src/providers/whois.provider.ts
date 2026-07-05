@@ -55,6 +55,8 @@ let rdapBootstrapCache: {
   expiresAt: number;
   services: RdapBootstrapService[];
 } | null = null;
+let rdapBootstrapInFlight: Promise<RdapBootstrapService[]> | null = null;
+const rdapLookupInFlight = new Map<string, Promise<RdapResponse>>();
 
 const normalizeDomain = (domain: string): string => {
   return domain.trim().toLowerCase().replace(/\.+$/u, '');
@@ -119,32 +121,42 @@ const getCachedRdapBootstrap = async (
     return rdapBootstrapCache.services;
   }
 
-  try {
-    const response = await fetchWithRetry(RDAP_BOOTSTRAP_URL, {
-      timeoutMs: Math.min(options.timeoutMs ?? 8_000, 5_000),
-      retryAttempts: 0,
-      retryBaseMs: Math.max(50, options.retryBaseMs ?? 500),
-      requestInit: {
-        method: 'GET',
-        headers: {
-          accept: 'application/json',
-          'user-agent': userAgent,
-        },
-      },
-    });
-
-    const payload = await response.json() as RdapBootstrapResponse;
-    const services = parseRdapBootstrapServices(payload);
-    if (services.length > 0) {
-      rdapBootstrapCache = {
-        expiresAt: now + RDAP_BOOTSTRAP_CACHE_TTL_MS,
-        services,
-      };
-    }
-    return services;
-  } catch {
-    return rdapBootstrapCache?.services ?? [];
+  if (rdapBootstrapInFlight) {
+    return rdapBootstrapInFlight;
   }
+
+  rdapBootstrapInFlight = (async () => {
+    try {
+      const response = await fetchWithRetry(RDAP_BOOTSTRAP_URL, {
+        timeoutMs: Math.min(options.timeoutMs ?? 8_000, 5_000),
+        retryAttempts: 0,
+        retryBaseMs: Math.max(50, options.retryBaseMs ?? 500),
+        requestInit: {
+          method: 'GET',
+          headers: {
+            accept: 'application/json',
+            'user-agent': userAgent,
+          },
+        },
+      });
+
+      const payload = await response.json() as RdapBootstrapResponse;
+      const services = parseRdapBootstrapServices(payload);
+      if (services.length > 0) {
+        rdapBootstrapCache = {
+          expiresAt: now + RDAP_BOOTSTRAP_CACHE_TTL_MS,
+          services,
+        };
+      }
+      return services;
+    } catch {
+      return rdapBootstrapCache?.services ?? [];
+    } finally {
+      rdapBootstrapInFlight = null;
+    }
+  })();
+
+  return rdapBootstrapInFlight;
 };
 
 const resolveRdapLookupSources = async (
@@ -311,6 +323,41 @@ const emptyWhoisLookup: WhoisLookupData = {
   domainAgeYears: null,
 };
 
+const fetchRdapPayload = (
+  source: RdapLookupSource,
+  options: ProviderRuntimeOptions,
+  userAgent: string,
+): Promise<RdapResponse> => {
+  const inFlightKey = `${userAgent}\n${source.url}`;
+  const existing = rdapLookupInFlight.get(inFlightKey);
+  if (existing) {
+    return existing;
+  }
+
+  const lookupPromise = (async () => {
+    const response = await fetchWithRetry(source.url, {
+      timeoutMs: options.timeoutMs ?? 8_000,
+      retryAttempts: options.retryAttempts ?? 2,
+      retryBaseMs: options.retryBaseMs ?? 500,
+      requestInit: {
+        method: 'GET',
+        headers: {
+          accept: 'application/rdap+json,application/json',
+          'user-agent': userAgent,
+        },
+      },
+    });
+
+    return response.json() as Promise<RdapResponse>;
+  })();
+
+  rdapLookupInFlight.set(inFlightKey, lookupPromise);
+  lookupPromise.finally(() => {
+    rdapLookupInFlight.delete(inFlightKey);
+  }).catch(() => undefined);
+  return lookupPromise;
+};
+
 export class WhoisProvider implements Provider<WhoisLookupData> {
   readonly name = 'whois.provider';
 
@@ -327,20 +374,7 @@ export class WhoisProvider implements Provider<WhoisLookupData> {
 
     for (const source of lookupSources) {
       try {
-        const response = await fetchWithRetry(source.url, {
-          timeoutMs: this.options.timeoutMs ?? 8_000,
-          retryAttempts: this.options.retryAttempts ?? 2,
-          retryBaseMs: this.options.retryBaseMs ?? 500,
-          requestInit: {
-            method: 'GET',
-            headers: {
-              accept: 'application/rdap+json,application/json',
-              'user-agent': this.userAgent,
-            },
-          },
-        });
-
-        const payload = await response.json() as RdapResponse;
+        const payload = await fetchRdapPayload(source, this.options, this.userAgent);
         const whois = parseWhoisData(payload);
 
         if (!whois) {

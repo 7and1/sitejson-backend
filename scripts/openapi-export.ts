@@ -5,7 +5,20 @@ import { buildOpenApiSpec } from '../src/api/openapi.js';
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const backendDir = path.resolve(scriptDir, '..');
-const outputPath = path.resolve(backendDir, '../docs/openapi.v1.json');
+
+const resolveOpenApiPath = () => {
+  if (process.env.SITEJSON_OPENAPI_PATH) {
+    return path.resolve(backendDir, process.env.SITEJSON_OPENAPI_PATH);
+  }
+
+  if (process.env.GITHUB_ACTIONS === 'true') {
+    return path.resolve(backendDir, 'docs/openapi.v1.json');
+  }
+
+  return path.resolve(backendDir, '../docs/openapi.v1.json');
+};
+
+const outputPath = resolveOpenApiPath();
 
 const spec = buildOpenApiSpec();
 const content = `${JSON.stringify(spec, null, 2)}\n`;

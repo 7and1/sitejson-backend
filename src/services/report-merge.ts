@@ -4,6 +4,18 @@ type TrafficData = NonNullable<SiteReport['trafficData']>;
 type WhoisRecord = NonNullable<TrafficData['whois']>;
 type ProviderHealthItem = NonNullable<SiteReport['providerHealth']>[number];
 
+const CHALLENGE_TITLE_PATTERNS: RegExp[] = [
+  /^just a moment/i,
+  /^attention required/i,
+  /^access denied/i,
+  /^security check/i,
+  /^checking your browser/i,
+  /^please wait/i,
+  /verify(?:ing)? you are (?:a )?human/i,
+  /^ddos protection/i,
+  /captcha/i,
+];
+
 const isPlainObject = (value: unknown): value is Record<string, unknown> => (
   typeof value === 'object' && value !== null && !Array.isArray(value)
 );
@@ -22,6 +34,13 @@ const normalizeAdSystemToken = (raw: string): string | null => {
   }
 
   return DOMAIN_PATTERN.test(token) ? token : null;
+};
+
+const isChallengePageTitle = (title?: string | null): boolean => {
+  if (!title) return false;
+  const trimmed = title.trim();
+  if (!trimmed) return false;
+  return CHALLENGE_TITLE_PATTERNS.some((pattern) => pattern.test(trimmed));
 };
 
 const sanitizeProviderHealth = (value: unknown): ProviderHealthItem[] | undefined => {
@@ -69,9 +88,84 @@ const sanitizePublisherAdSystems = (value: unknown): string[] | undefined => {
   return deduped;
 };
 
+const markBlockedProviderHealth = (value: unknown): ProviderHealthItem[] => {
+  const byProvider = new Map<string, ProviderHealthItem>();
+  for (const item of sanitizeProviderHealth(value) ?? []) {
+    byProvider.set(item.provider, item);
+  }
+
+  for (const provider of ['meta.provider', 'seo.provider', 'ai.provider']) {
+    byProvider.set(provider, {
+      provider,
+      ok: false,
+      errorCode: 'BOT_CHALLENGE_BLOCKED',
+    });
+  }
+
+  return Array.from(byProvider.values());
+};
+
+const stripBlockedCrawlArtifacts = (topLevel: Record<string, unknown>): void => {
+  delete topLevel.meta;
+  delete topLevel.seo;
+  delete topLevel.taxonomy;
+  delete topLevel.aiAnalysis;
+
+  const visual = topLevel.visual;
+  if (isPlainObject(visual)) {
+    const visualPayload = { ...visual };
+    delete visualPayload.dominantColor;
+    delete visualPayload.palette;
+    topLevel.visual = visualPayload;
+  }
+
+  const metaPayload = isPlainObject(topLevel._meta) ? { ...topLevel._meta } : {};
+  const htmlPayload = isPlainObject(metaPayload.html) ? { ...metaPayload.html } : {};
+  delete htmlPayload.primary_h1;
+  htmlPayload.length = 0;
+  htmlPayload.blocked = true;
+  metaPayload.html = htmlPayload;
+  topLevel._meta = metaPayload;
+  topLevel.providerHealth = markBlockedProviderHealth(topLevel.providerHealth);
+};
+
+export const isBlockedSiteReport = (report: SiteReport): boolean => (
+  Boolean(report._meta?.html?.blocked) || isChallengePageTitle(report.meta?.title)
+);
+
+export const guardBlockedSiteReport = (report: SiteReport): SiteReport => {
+  if (!isBlockedSiteReport(report)) {
+    return report;
+  }
+
+  const topLevel = { ...(report as unknown as Record<string, unknown>) };
+  stripBlockedCrawlArtifacts(topLevel);
+  return topLevel as unknown as SiteReport;
+};
+
 export const sanitizeSiteReport = (report: SiteReport): SiteReport => {
   const topLevel = { ...(report as unknown as Record<string, unknown>) };
-  delete topLevel.score;
+
+  const score = topLevel.score;
+  if (isPlainObject(score)) {
+    const value = typeof score.value === 'number' && Number.isFinite(score.value)
+      ? Math.max(0, Math.min(100, score.value))
+      : null;
+    const signals = Array.isArray(score.signals)
+      ? score.signals.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+      : [];
+
+    if (value !== null) {
+      topLevel.score = {
+        value,
+        signals,
+      };
+    } else {
+      delete topLevel.score;
+    }
+  } else if (score !== undefined) {
+    delete topLevel.score;
+  }
 
   const seo = topLevel.seo;
   if (isPlainObject(seo)) {
@@ -97,6 +191,22 @@ export const sanitizeSiteReport = (report: SiteReport): SiteReport => {
       delete publisherPayload.adSystems;
     }
     topLevel.publisher = publisherPayload;
+  }
+
+  const visual = topLevel.visual;
+  if (isPlainObject(visual)) {
+    const visualPayload = { ...visual };
+    // Internal filesystem path must never be exposed in API output.
+    delete visualPayload.screenshotPath;
+    topLevel.visual = visualPayload;
+  }
+
+  if (isChallengePageTitle(
+    isPlainObject(topLevel.meta) && typeof topLevel.meta.title === 'string'
+      ? topLevel.meta.title
+      : null,
+  )) {
+    stripBlockedCrawlArtifacts(topLevel);
   }
 
   return topLevel as unknown as SiteReport;
@@ -279,36 +389,39 @@ const mergeProviderHealth = (
 
 export const mergeSiteReports = (previous: SiteReport | null, next: SiteReport): SiteReport => {
   const sanitizedNext = sanitizeSiteReport(next);
+  const nextIsBlocked = isBlockedSiteReport(sanitizedNext);
+  const effectiveNext = nextIsBlocked ? guardBlockedSiteReport(sanitizedNext) : sanitizedNext;
   if (!previous) {
-    return sanitizedNext;
+    return effectiveNext;
   }
   const sanitizedPrevious = sanitizeSiteReport(previous);
 
-  const mergedTrafficData = mergeTrafficData(sanitizedPrevious.trafficData, sanitizedNext.trafficData);
-  const mergedWhoisSnapshot = mergeWhoisSnapshot(sanitizedPrevious.trafficData, sanitizedNext.trafficData);
+  const mergedTrafficData = mergeTrafficData(sanitizedPrevious.trafficData, effectiveNext.trafficData);
+  const mergedWhoisSnapshot = mergeWhoisSnapshot(sanitizedPrevious.trafficData, effectiveNext.trafficData);
 
   return sanitizeSiteReport({
     ...sanitizedPrevious,
-    ...sanitizedNext,
-    updatedAt: sanitizedNext.updatedAt,
-    freshnessTtlSec: sanitizedNext.freshnessTtlSec ?? sanitizedPrevious.freshnessTtlSec,
-    visual: mergeObject(sanitizedPrevious.visual, sanitizedNext.visual),
-    meta: mergeObject(sanitizedPrevious.meta, sanitizedNext.meta),
-    seo: mergeObject(sanitizedPrevious.seo, sanitizedNext.seo),
-    files: mergeObject(sanitizedPrevious.files, sanitizedNext.files),
-    dns: mergeObject(sanitizedPrevious.dns, sanitizedNext.dns),
-    ads: mergeObject(sanitizedPrevious.ads, sanitizedNext.ads),
-    publisher: mergeObject(sanitizedPrevious.publisher, sanitizedNext.publisher),
+    ...effectiveNext,
+    updatedAt: effectiveNext.updatedAt,
+    freshnessTtlSec: effectiveNext.freshnessTtlSec ?? sanitizedPrevious.freshnessTtlSec,
+    visual: nextIsBlocked ? effectiveNext.visual : mergeObject(sanitizedPrevious.visual, effectiveNext.visual),
+    meta: nextIsBlocked ? effectiveNext.meta : mergeObject(sanitizedPrevious.meta, effectiveNext.meta),
+    seo: nextIsBlocked ? effectiveNext.seo : mergeObject(sanitizedPrevious.seo, effectiveNext.seo),
+    files: mergeObject(sanitizedPrevious.files, effectiveNext.files),
+    dns: mergeObject(sanitizedPrevious.dns, effectiveNext.dns),
+    ads: mergeObject(sanitizedPrevious.ads, effectiveNext.ads),
+    publisher: mergeObject(sanitizedPrevious.publisher, effectiveNext.publisher),
+    authority: mergeObject(sanitizedPrevious.authority, effectiveNext.authority),
     trafficData: mergedTrafficData
       ? {
           ...mergedTrafficData,
           ...mergedWhoisSnapshot,
         }
       : (Object.keys(mergedWhoisSnapshot).length > 0 ? mergedWhoisSnapshot : undefined),
-    radar: mergeObject(sanitizedPrevious.radar, sanitizedNext.radar),
-    taxonomy: mergeObject(sanitizedPrevious.taxonomy, sanitizedNext.taxonomy),
-    aiAnalysis: mergeObject(sanitizedPrevious.aiAnalysis, sanitizedNext.aiAnalysis),
-    providerHealth: mergeProviderHealth(sanitizedPrevious.providerHealth, sanitizedNext.providerHealth),
-    _meta: mergeMeta(sanitizedPrevious._meta, sanitizedNext._meta),
+    radar: mergeObject(sanitizedPrevious.radar, effectiveNext.radar),
+    taxonomy: nextIsBlocked ? effectiveNext.taxonomy : mergeObject(sanitizedPrevious.taxonomy, effectiveNext.taxonomy),
+    aiAnalysis: nextIsBlocked ? effectiveNext.aiAnalysis : mergeObject(sanitizedPrevious.aiAnalysis, effectiveNext.aiAnalysis),
+    providerHealth: mergeProviderHealth(sanitizedPrevious.providerHealth, effectiveNext.providerHealth),
+    _meta: mergeMeta(sanitizedPrevious._meta, effectiveNext._meta),
   });
 };

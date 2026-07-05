@@ -1,9 +1,15 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   extractSimilarwebPayload,
   parseRscResponse,
   transformSimilarwebData,
 } from '../traffic.provider.js';
+
+vi.mock('undici', () => ({
+  Agent: class {},
+  ProxyAgent: class {},
+  fetch: globalThis.fetch,
+}), { virtual: true });
 
 describe('TrafficProvider Parser', () => {
   const mockRscResponse = `
@@ -68,7 +74,10 @@ describe('TrafficProvider Parser', () => {
       bounce_rate: 49.5,
       pages_per_visit: 2.8,
       avg_visit_duration: 214.3,
+      stale: true,
+      data_age_days: 47,
       snapshot_date: '2026-01-10',
+      last_updated: '2026-02-03T04:05:06Z',
       traffic_sources: {
         direct: 31,
         referral: 19,
@@ -90,10 +99,13 @@ describe('TrafficProvider Parser', () => {
     expect(trafficData.countryRank).toBe(12);
     expect(trafficData.dataYear).toBe('2026');
     expect(trafficData.dataMonth).toBe('01');
+    expect(trafficData.isStale).toBe(true);
+    expect(trafficData.dataAgeDays).toBe(47);
+    expect(trafficData.snapshotDate).toBe('2026-01-10');
     expect(trafficData.trafficSources?.paid).toBe(5);
     expect(trafficData.topKeywords[0]?.keyword).toBe('sitejson');
     expect(trafficData.topRegions[0]?.country).toBe('United States');
-    expect(trafficData.cachedAt).toBeNull();
+    expect(trafficData.cachedAt).toBe(1770091506);
   });
 
   it('should transform ProxyGrid similarweb payload shape', () => {
@@ -133,9 +145,13 @@ describe('TrafficProvider Parser', () => {
     expect(trafficData.countryRank).toBe(331);
     expect(trafficData.dataYear).toBe('2026');
     expect(trafficData.dataMonth).toBe('01');
+    expect(trafficData.isStale).toBeNull();
+    expect(trafficData.dataAgeDays).toBeNull();
+    expect(trafficData.snapshotDate).toBeNull();
     expect(trafficData.trafficSources?.direct).toBeCloseTo(0.4017, 4);
     expect(trafficData.trafficSources?.paid).toBeCloseTo(0.0031, 4);
     expect(trafficData.topRegions[0]?.countryCode).toBe(840);
     expect(trafficData.topRegions[0]?.country).toBe('US');
+    expect(trafficData.cachedAt).toBeNull();
   });
 });

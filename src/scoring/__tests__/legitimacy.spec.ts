@@ -8,7 +8,12 @@ describe('calculateLegitimacyScore', () => {
       updatedAt: new Date().toISOString(),
       dns: {
         provider: 'Cloudflare',
+        aRecords: ['203.0.113.10'],
+        aaaaRecords: ['2001:db8::10'],
+        caaRecords: ['0 issue "letsencrypt.org"'],
         mxRecords: ['aspmx.l.google.com'],
+        nsRecords: ['ns1.example.com'],
+        txtRecords: ['"v=spf1 include:_spf.google.com ~all"', '"v=DMARC1; p=reject"'],
       },
       seo: {
         h1Count: 1,
@@ -28,7 +33,12 @@ describe('calculateLegitimacyScore', () => {
 
     expect(result.value).toBeGreaterThan(0);
     expect(result.value).toBeLessThanOrEqual(100);
+    expect(result.signals).toContain('has_address_records');
+    expect(result.signals).toContain('has_caa');
     expect(result.signals).toContain('has_mx');
+    expect(result.signals).toContain('has_spf');
+    expect(result.signals).toContain('has_dmarc');
+    expect(result.signals).toContain('ai_professional');
   });
 
   it('applies spam penalty', () => {
@@ -44,8 +54,8 @@ describe('calculateLegitimacyScore', () => {
       },
     });
 
-    expect(result.value).toBe(0);
-    expect(result.signals).toContain('spam_signal');
+    expect(result.value).toBe(10);
+    expect(result.signals).toContain('spam_signal_unconfirmed');
   });
 
   it('penalizes domains expiring within 30 days', () => {
@@ -116,5 +126,94 @@ describe('calculateLegitimacyScore', () => {
 
     expect(result.signals).not.toContain('domain_expires_soon');
     expect(result.signals).not.toContain('domain_held');
+  });
+
+  it('requires corroboration before AI can add positive legitimacy weight', () => {
+    const result = calculateLegitimacyScore({
+      domain: 'thin.example',
+      updatedAt: new Date().toISOString(),
+      aiAnalysis: {
+        risk: {
+          sentiment: 'Professional',
+          score: 4,
+          isSpam: false,
+        },
+      },
+    });
+
+    expect(result.value).toBe(10);
+    expect(result.signals).toContain('ai_professional_unconfirmed');
+    expect(result.signals).not.toContain('ai_professional');
+  });
+
+  it('caps confirmed spam penalty to a small bounded adjustment', () => {
+    const result = calculateLegitimacyScore({
+      domain: 'spam.example',
+      updatedAt: new Date().toISOString(),
+      dns: {
+        provider: 'Cloudflare',
+        mxRecords: ['mx.example.com'],
+      },
+      aiAnalysis: {
+        risk: {
+          sentiment: 'Spammy',
+          score: 90,
+          isSpam: true,
+        },
+      },
+    });
+
+    expect(result.value).toBe(10);
+    expect(result.signals).toContain('spam_signal');
+  });
+
+  it('awards email-auth trust signals from TXT records', () => {
+    const result = calculateLegitimacyScore({
+      domain: 'mail.example',
+      updatedAt: new Date().toISOString(),
+      dns: {
+        provider: 'Other',
+        mxRecords: [],
+        nsRecords: [],
+        txtRecords: [
+          '"v=spf1 include:_spf.example.com -all"',
+          '"v=DMARC1; p=quarantine; rua=mailto:dmarc@example.com"',
+          '"v=DKIM1; k=rsa; p=abc123"',
+        ],
+      },
+    });
+
+    expect(result.signals).toContain('has_spf');
+    expect(result.signals).toContain('has_dmarc');
+    expect(result.signals).toContain('has_dkim');
+    expect(result.value).toBeGreaterThan(10);
+  });
+
+  it('treats address and CAA records as corroborating trust signals', () => {
+    const result = calculateLegitimacyScore({
+      domain: 'dns.example',
+      updatedAt: new Date().toISOString(),
+      dns: {
+        provider: 'Cloudflare',
+        aRecords: ['203.0.113.10'],
+        aaaaRecords: ['2001:db8::10'],
+        caaRecords: ['0 issue "letsencrypt.org"'],
+        mxRecords: [],
+        nsRecords: [],
+        txtRecords: [],
+      },
+      aiAnalysis: {
+        risk: {
+          sentiment: 'Professional',
+          score: 5,
+          isSpam: false,
+        },
+      },
+    });
+
+    expect(result.signals).toContain('has_address_records');
+    expect(result.signals).toContain('has_caa');
+    expect(result.signals).toContain('ai_professional');
+    expect(result.value).toBeGreaterThan(10);
   });
 });

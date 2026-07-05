@@ -24,6 +24,7 @@ export const buildOpenApiSpec = () => ({
         type: 'apiKey',
         in: 'header',
         name: 'x-api-key',
+        description: 'Public API key for normal requests. Ops endpoints and privileged analyze flags require SITEJSON_OPS_API_KEY.',
       },
     },
     schemas: {
@@ -76,10 +77,11 @@ export const buildOpenApiSpec = () => ({
         type: 'object',
         properties: {
           domain: { type: 'string', example: 'example.com' },
-          force_refresh: { type: 'boolean', default: false },
-          force_ai: { type: 'boolean', default: false },
+          force_refresh: { type: 'boolean', default: false, description: 'Requires ops API key when true.' },
+          force_ai: { type: 'boolean', default: false, description: 'Requires ops API key when true.' },
           skip_ai: { type: 'boolean', default: false },
-          priority: { type: 'string', enum: ['normal', 'high'], default: 'normal' },
+          priority: { type: 'string', enum: ['normal', 'high'], default: 'normal', description: 'priority=high requires ops API key.' },
+          webhook_url: { type: 'string', format: 'uri' },
         },
         required: ['domain'],
       },
@@ -90,13 +92,23 @@ export const buildOpenApiSpec = () => ({
             type: 'array',
             items: { type: 'string' },
             minItems: 1,
+            maxItems: 100,
           },
-          priority: { type: 'string', enum: ['normal', 'high'], default: 'normal' },
-          force_refresh: { type: 'boolean', default: false },
-          force_ai: { type: 'boolean', default: false },
+          priority: { type: 'string', enum: ['normal', 'high'], default: 'normal', description: 'priority=high requires ops API key.' },
+          force_refresh: { type: 'boolean', default: false, description: 'Requires ops API key when true.' },
+          force_ai: { type: 'boolean', default: false, description: 'Requires ops API key when true.' },
           skip_ai: { type: 'boolean', default: false },
         },
         required: ['domains'],
+      },
+      TrafficHistoryQuery: {
+        type: 'object',
+        properties: {
+          limit: { type: 'integer', minimum: 1, maximum: 24 },
+          offset: { type: 'integer', minimum: 0, maximum: 1000 },
+          from: { type: 'string', pattern: '^\\d{4}-\\d{2}-\\d{2}$' },
+          to: { type: 'string', pattern: '^\\d{4}-\\d{2}-\\d{2}$' },
+        },
       },
       IngestDomainsResponse: {
         type: 'object',
@@ -129,7 +141,10 @@ export const buildOpenApiSpec = () => ({
               job_id: { type: 'string', nullable: true, example: 'job_123' },
               status: { type: 'string', enum: ['pending', 'completed'], example: 'pending' },
               priority: { type: 'string', enum: ['normal', 'high'], example: 'normal' },
-              reason: { type: 'string', enum: ['QUEUED', 'ALREADY_FRESH'], example: 'QUEUED' },
+              reason: { type: 'string', enum: ['QUEUED', 'ALREADY_FRESH', 'JOB_ALREADY_RUNNING'], example: 'QUEUED' },
+              freshness: { $ref: '#/components/schemas/Freshness' },
+              enrichment: { $ref: '#/components/schemas/SiteEnrichmentStatus' },
+              report: { $ref: '#/components/schemas/SiteReport' },
             },
             required: ['job_id', 'status', 'priority', 'reason'],
           },
@@ -145,6 +160,17 @@ export const buildOpenApiSpec = () => ({
         },
         required: ['is_stale', 'updated_at'],
       },
+      SiteEnrichmentStatus: {
+        type: 'object',
+        properties: {
+          pending: { type: 'boolean' },
+          pending_layers: {
+            type: 'array',
+            items: { type: 'string', enum: ['async_ai', 'traffic', 'whois'] },
+          },
+        },
+        required: ['pending', 'pending_layers'],
+      },
       ProviderHealthItem: {
         type: 'object',
         properties: {
@@ -153,6 +179,89 @@ export const buildOpenApiSpec = () => ({
           errorCode: { type: 'string' },
         },
         required: ['provider', 'ok'],
+      },
+      ProviderHealthSnapshot: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          errorCode: { type: 'string' },
+        },
+        required: ['ok'],
+      },
+      ProviderCompleteness: {
+        type: 'object',
+        properties: {
+          total: { type: 'integer', minimum: 0 },
+          present: { type: 'integer', minimum: 0 },
+          missing: { type: 'integer', minimum: 0 },
+          fields: {
+            type: 'object',
+            additionalProperties: { type: 'boolean' },
+          },
+        },
+        required: ['total', 'present', 'missing', 'fields'],
+      },
+      ProviderSummaryItem: {
+        type: 'object',
+        properties: {
+          provider: { type: 'string', example: 'meta' },
+          hasData: { type: 'boolean' },
+          health: {
+            allOf: [{ $ref: '#/components/schemas/ProviderHealthSnapshot' }],
+            nullable: true,
+          },
+          completeness: { $ref: '#/components/schemas/ProviderCompleteness' },
+        },
+        required: ['provider', 'hasData', 'health', 'completeness'],
+      },
+      ProviderSummaryResponse: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean', enum: [true] },
+          data: {
+            type: 'object',
+            properties: {
+              domain: { type: 'string' },
+              updatedAt: { type: 'string', format: 'date-time' },
+              providers: {
+                type: 'array',
+                items: { $ref: '#/components/schemas/ProviderSummaryItem' },
+              },
+              _meta: { $ref: '#/components/schemas/SiteMeta' },
+            },
+            required: ['domain', 'updatedAt', 'providers'],
+          },
+          meta: { $ref: '#/components/schemas/TraceMeta' },
+        },
+        required: ['ok', 'data', 'meta'],
+      },
+      ProviderDetailResponse: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean', enum: [true] },
+          data: {
+            type: 'object',
+            properties: {
+              domain: { type: 'string' },
+              provider: { type: 'string', example: 'meta' },
+              updatedAt: { type: 'string', format: 'date-time' },
+              hasData: { type: 'boolean' },
+              health: {
+                allOf: [{ $ref: '#/components/schemas/ProviderHealthSnapshot' }],
+                nullable: true,
+              },
+              completeness: { $ref: '#/components/schemas/ProviderCompleteness' },
+              data: {
+                type: 'object',
+                nullable: true,
+                additionalProperties: true,
+              },
+            },
+            required: ['domain', 'provider', 'updatedAt', 'hasData', 'health', 'completeness', 'data'],
+          },
+          meta: { $ref: '#/components/schemas/TraceMeta' },
+        },
+        required: ['ok', 'data', 'meta'],
       },
       VisualReport: {
         type: 'object',
@@ -206,6 +315,18 @@ export const buildOpenApiSpec = () => ({
         type: 'object',
         properties: {
           provider: { type: 'string' },
+          aRecords: {
+            type: 'array',
+            items: { type: 'string' },
+          },
+          aaaaRecords: {
+            type: 'array',
+            items: { type: 'string' },
+          },
+          caaRecords: {
+            type: 'array',
+            items: { type: 'string' },
+          },
           mxRecords: {
             type: 'array',
             items: { type: 'string' },
@@ -255,13 +376,36 @@ export const buildOpenApiSpec = () => ({
           },
         },
       },
+      AuthorityReport: {
+        type: 'object',
+        properties: {
+          domainRating: { type: 'number', nullable: true, minimum: 0, maximum: 100 },
+          source: { type: 'string', enum: ['ahrefs'] },
+          licenseUrl: { type: 'string', format: 'uri' },
+          attribution: { type: 'string', enum: ['Domain Rating by Ahrefs'] },
+          fetchedAt: { type: 'string', format: 'date-time' },
+        },
+      },
       TrafficRegion: {
         type: 'object',
         properties: {
+          countryCode: { type: 'number' },
           country: { type: 'string' },
           share: { type: 'number' },
         },
         required: ['country', 'share'],
+      },
+      TrafficSources: {
+        type: 'object',
+        properties: {
+          direct: { type: 'number' },
+          search: { type: 'number' },
+          social: { type: 'number' },
+          referral: { type: 'number' },
+          mail: { type: 'number' },
+          paid: { type: 'number' },
+        },
+        required: ['direct', 'search', 'social', 'referral', 'mail', 'paid'],
       },
       TrafficKeyword: {
         type: 'object',
@@ -271,6 +415,52 @@ export const buildOpenApiSpec = () => ({
           cpc: { type: 'number' },
         },
         required: ['keyword', 'volume', 'cpc'],
+      },
+      TrafficHistorySnapshot: {
+        type: 'object',
+        properties: {
+          snapshotDate: { type: 'string' },
+          monthlyVisits: { type: 'number', nullable: true },
+          monthlyVisitsChange: { type: 'number', nullable: true },
+          globalRank: { type: 'number', nullable: true },
+          countryRank: { type: 'number', nullable: true },
+          categoryRank: { type: 'number', nullable: true },
+          bounceRate: { type: 'number', nullable: true },
+          pagesPerVisit: { type: 'number', nullable: true },
+          avgVisitDuration: { type: 'number', nullable: true },
+          dataSource: { type: 'string', nullable: true },
+          collectedAt: { type: 'string', nullable: true },
+        },
+        required: ['snapshotDate'],
+      },
+      SiteTrafficHistoryResponse: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean', enum: [true] },
+          data: {
+            type: 'object',
+            properties: {
+              domain: { type: 'string' },
+              totalSnapshots: { type: 'integer' },
+              pagination: {
+                type: 'object',
+                properties: {
+                  limit: { type: 'integer' },
+                  offset: { type: 'integer' },
+                  hasMore: { type: 'boolean' },
+                },
+                required: ['limit', 'offset', 'hasMore'],
+              },
+              snapshots: {
+                type: 'array',
+                items: { $ref: '#/components/schemas/TrafficHistorySnapshot' },
+              },
+            },
+            required: ['domain', 'totalSnapshots', 'pagination', 'snapshots'],
+          },
+          meta: { $ref: '#/components/schemas/TraceMeta' },
+        },
+        required: ['ok', 'data', 'meta'],
       },
       TrafficWhois: {
         type: 'object',
@@ -298,6 +488,13 @@ export const buildOpenApiSpec = () => ({
           bounceRate: { type: 'number', nullable: true },
           avgVisitDuration: { type: 'number', nullable: true },
           pagesPerVisit: { type: 'number', nullable: true },
+          dataYear: { type: 'string', nullable: true },
+          dataMonth: { type: 'string', nullable: true },
+          isStale: { type: 'boolean', nullable: true },
+          dataAgeDays: { type: 'number', nullable: true },
+          snapshotDate: { type: 'string', nullable: true },
+          cachedAt: { type: 'number', nullable: true, description: 'Unix timestamp in seconds.' },
+          trafficSources: { $ref: '#/components/schemas/TrafficSources', nullable: true },
           topCountry: { type: 'string' },
           topRegions: {
             type: 'array',
@@ -387,7 +584,19 @@ export const buildOpenApiSpec = () => ({
           source: { type: 'string', enum: ['browser', 'direct', 'proxy_grid', 'soax', 'none'] },
           length: { type: 'number' },
           primary_h1: { type: 'string' },
+          blocked: { type: 'boolean' },
         },
+      },
+      LegitimacyScore: {
+        type: 'object',
+        properties: {
+          value: { type: 'number', minimum: 0, maximum: 100 },
+          signals: {
+            type: 'array',
+            items: { type: 'string' },
+          },
+        },
+        required: ['value', 'signals'],
       },
       SiteMetaAi: {
         type: 'object',
@@ -424,6 +633,7 @@ export const buildOpenApiSpec = () => ({
           domain: { type: 'string' },
           updatedAt: { type: 'string', format: 'date-time' },
           freshnessTtlSec: { type: 'number' },
+          score: { $ref: '#/components/schemas/LegitimacyScore' },
           visual: { $ref: '#/components/schemas/VisualReport' },
           meta: { $ref: '#/components/schemas/MetaReport' },
           seo: { $ref: '#/components/schemas/SeoReport' },
@@ -431,6 +641,7 @@ export const buildOpenApiSpec = () => ({
           dns: { $ref: '#/components/schemas/DnsReport' },
           ads: { $ref: '#/components/schemas/AdsReport' },
           publisher: { $ref: '#/components/schemas/PublisherReport' },
+          authority: { $ref: '#/components/schemas/AuthorityReport' },
           trafficData: { $ref: '#/components/schemas/TrafficReport' },
           radar: { $ref: '#/components/schemas/RadarReport' },
           taxonomy: { $ref: '#/components/schemas/TaxonomyReport' },
@@ -453,9 +664,10 @@ export const buildOpenApiSpec = () => ({
               domain: { type: 'string' },
               status: { type: 'string', enum: ['completed'], example: 'completed' },
               freshness: { $ref: '#/components/schemas/Freshness' },
+              enrichment: { $ref: '#/components/schemas/SiteEnrichmentStatus' },
               report: { $ref: '#/components/schemas/SiteReport' },
             },
-            required: ['domain', 'status', 'freshness', 'report'],
+            required: ['domain', 'status', 'freshness', 'enrichment', 'report'],
           },
           meta: { $ref: '#/components/schemas/TraceMeta' },
         },
@@ -474,6 +686,15 @@ export const buildOpenApiSpec = () => ({
               progress: { type: 'number' },
               stage: { type: 'string' },
               updated_at: { type: 'string', format: 'date-time' },
+              error: {
+                type: 'object',
+                description: 'Present only when status is failed.',
+                properties: {
+                  code: { type: 'string', example: 'JOB_FAILED' },
+                  message: { type: 'string' },
+                },
+                required: ['code', 'message'],
+              },
             },
             required: ['job_id', 'status', 'priority', 'progress', 'updated_at'],
           },
@@ -558,6 +779,66 @@ export const buildOpenApiSpec = () => ({
         },
         required: ['ok', 'data', 'meta'],
       },
+      GlobalInsightsResponse: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean', enum: [true] },
+          data: {
+            type: 'object',
+            properties: {
+              totalSites: { type: 'integer', minimum: 0 },
+              withTraffic: { type: 'integer', minimum: 0 },
+              withScore: { type: 'integer', minimum: 0 },
+              scoreDistribution: {
+                type: 'object',
+                properties: {
+                  high: { type: 'integer', minimum: 0 },
+                  medium: { type: 'integer', minimum: 0 },
+                  low: { type: 'integer', minimum: 0 },
+                  unscored: { type: 'integer', minimum: 0 },
+                },
+                required: ['high', 'medium', 'low', 'unscored'],
+              },
+              topCategories: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    slug: { type: 'string' },
+                    count: { type: 'integer', minimum: 0 },
+                  },
+                  required: ['slug', 'count'],
+                },
+              },
+              topTechnologies: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    name: { type: 'string' },
+                    count: { type: 'integer', minimum: 0 },
+                  },
+                  required: ['name', 'count'],
+                },
+              },
+              topTopics: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    name: { type: 'string' },
+                    count: { type: 'integer', minimum: 0 },
+                  },
+                  required: ['name', 'count'],
+                },
+              },
+            },
+            required: ['totalSites', 'withTraffic', 'withScore', 'scoreDistribution', 'topCategories', 'topTechnologies', 'topTopics'],
+          },
+          meta: { $ref: '#/components/schemas/TraceMeta' },
+        },
+        required: ['ok', 'data', 'meta'],
+      },
       OpsRecentItem: {
         type: 'object',
         properties: {
@@ -571,6 +852,17 @@ export const buildOpenApiSpec = () => ({
           error_message: { type: 'string' },
         },
         required: ['job_id', 'domain', 'status', 'priority', 'rank', 'updated_at'],
+      },
+      OpsAlert: {
+        type: 'object',
+        properties: {
+          code: { type: 'string', enum: ['QUEUE_FAILED_JOBS'] },
+          severity: { type: 'string', enum: ['warning'] },
+          queue: { type: 'string' },
+          failed: { type: 'integer', minimum: 1 },
+          message: { type: 'string' },
+        },
+        required: ['code', 'severity', 'queue', 'failed', 'message'],
       },
       OpsDashboardResponse: {
         type: 'object',
@@ -616,6 +908,10 @@ export const buildOpenApiSpec = () => ({
                 items: { $ref: '#/components/schemas/OpsRecentItem' },
               },
               generated_at: { type: 'string', format: 'date-time' },
+              alerts: {
+                type: 'array',
+                items: { $ref: '#/components/schemas/OpsAlert' },
+              },
               queue_by_type: {
                 type: 'object',
                 additionalProperties: {
@@ -632,7 +928,7 @@ export const buildOpenApiSpec = () => ({
                 },
               },
             },
-            required: ['window', 'queue', 'jobs', 'quality', 'recent_items', 'generated_at'],
+            required: ['window', 'queue', 'jobs', 'quality', 'recent_items', 'generated_at', 'alerts'],
           },
           meta: { $ref: '#/components/schemas/TraceMeta' },
         },
@@ -715,8 +1011,12 @@ export const buildOpenApiSpec = () => ({
                   required: ['waiting', 'active', 'completed', 'failed', 'delayed', 'prioritized'],
                 },
               },
+              alerts: {
+                type: 'array',
+                items: { $ref: '#/components/schemas/OpsAlert' },
+              },
             },
-            required: ['queues'],
+            required: ['queues', 'alerts'],
           },
           meta: { $ref: '#/components/schemas/TraceMeta' },
         },
@@ -787,8 +1087,24 @@ export const buildOpenApiSpec = () => ({
               },
             },
           },
-          '409': {
-            description: 'Job already running',
+          '403': {
+            description: 'Forbidden; ops API key required for privileged flags',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/ErrorEnvelope' },
+              },
+            },
+          },
+          '429': {
+            description: 'Analyze rate limit exceeded',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/ErrorEnvelope' },
+              },
+            },
+          },
+          '503': {
+            description: 'Queue capacity temporarily exhausted',
             content: {
               'application/json': {
                 schema: { $ref: '#/components/schemas/ErrorEnvelope' },
@@ -797,6 +1113,74 @@ export const buildOpenApiSpec = () => ({
           },
           '500': {
             description: 'Internal error',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/ErrorEnvelope' },
+              },
+            },
+          },
+        },
+      },
+    },
+    '/api/v1/sites/{domain}/traffic-history': {
+      get: {
+        summary: 'Get traffic history snapshots for a domain',
+        tags: ['Sites'],
+        parameters: [
+          {
+            in: 'path',
+            name: 'domain',
+            required: true,
+            schema: { type: 'string' },
+          },
+          {
+            in: 'query',
+            name: 'limit',
+            schema: { type: 'integer', minimum: 1, maximum: 24 },
+          },
+          {
+            in: 'query',
+            name: 'offset',
+            schema: { type: 'integer', minimum: 0, maximum: 1000 },
+          },
+          {
+            in: 'query',
+            name: 'from',
+            schema: { type: 'string', pattern: '^\\d{4}-\\d{2}-\\d{2}$' },
+          },
+          {
+            in: 'query',
+            name: 'to',
+            schema: { type: 'string', pattern: '^\\d{4}-\\d{2}-\\d{2}$' },
+          },
+        ],
+        responses: {
+          '200': {
+            description: 'Traffic history',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/SiteTrafficHistoryResponse' },
+              },
+            },
+          },
+          '400': {
+            description: 'Invalid request/domain',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/ErrorEnvelope' },
+              },
+            },
+          },
+          '404': {
+            description: 'Traffic history not found',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/ErrorEnvelope' },
+              },
+            },
+          },
+          '503': {
+            description: 'Traffic history unavailable',
             content: {
               'application/json': {
                 schema: { $ref: '#/components/schemas/ErrorEnvelope' },
@@ -843,6 +1227,30 @@ export const buildOpenApiSpec = () => ({
               },
             },
           },
+          '403': {
+            description: 'Forbidden; ops API key required for privileged flags',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/ErrorEnvelope' },
+              },
+            },
+          },
+          '429': {
+            description: 'Ingest rate limit exceeded',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/ErrorEnvelope' },
+              },
+            },
+          },
+          '503': {
+            description: 'Queue capacity temporarily exhausted',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/ErrorEnvelope' },
+              },
+            },
+          },
         },
       },
     },
@@ -869,6 +1277,111 @@ export const buildOpenApiSpec = () => ({
           },
           '400': {
             description: 'Invalid domain',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/ErrorEnvelope' },
+              },
+            },
+          },
+          '401': {
+            description: 'Unauthorized',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/ErrorEnvelope' },
+              },
+            },
+          },
+          '404': {
+            description: 'Site not found',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/ErrorEnvelope' },
+              },
+            },
+          },
+        },
+      },
+    },
+    '/api/v1/sites/{domain}/providers': {
+      get: {
+        summary: 'Get provider completeness and health summary for a site',
+        tags: ['Sites'],
+        parameters: [
+          {
+            in: 'path',
+            name: 'domain',
+            required: true,
+            schema: { type: 'string' },
+          },
+        ],
+        responses: {
+          '200': {
+            description: 'OK',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/ProviderSummaryResponse' },
+              },
+            },
+          },
+          '400': {
+            description: 'Invalid domain',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/ErrorEnvelope' },
+              },
+            },
+          },
+          '401': {
+            description: 'Unauthorized',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/ErrorEnvelope' },
+              },
+            },
+          },
+          '404': {
+            description: 'Site not found',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/ErrorEnvelope' },
+              },
+            },
+          },
+        },
+      },
+    },
+    '/api/v1/sites/{domain}/providers/{provider}': {
+      get: {
+        summary: 'Get provider-specific data, completeness, and health for a site',
+        tags: ['Sites'],
+        parameters: [
+          {
+            in: 'path',
+            name: 'domain',
+            required: true,
+            schema: { type: 'string' },
+          },
+          {
+            in: 'path',
+            name: 'provider',
+            required: true,
+            schema: {
+              type: 'string',
+              enum: ['visual', 'meta', 'seo', 'dns', 'ads', 'publisher', 'files', 'authority', 'traffic', 'whois', 'radar', 'ai'],
+            },
+          },
+        ],
+        responses: {
+          '200': {
+            description: 'OK',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/ProviderDetailResponse' },
+              },
+            },
+          },
+          '400': {
+            description: 'Invalid domain or provider',
             content: {
               'application/json': {
                 schema: { $ref: '#/components/schemas/ErrorEnvelope' },
@@ -969,6 +1482,12 @@ export const buildOpenApiSpec = () => ({
         responses: {
           '200': {
             description: 'OK',
+            headers: {
+              'Retry-After': {
+                schema: { type: 'string' },
+                description: 'Suggested polling delay in seconds while the job is pending or running.',
+              },
+            },
             content: {
               'application/json': {
                 schema: { $ref: '#/components/schemas/JobResponse' },
@@ -1052,6 +1571,43 @@ export const buildOpenApiSpec = () => ({
         },
       },
     },
+    '/api/v1/insights': {
+      get: {
+        summary: 'Global public insights',
+        tags: ['Directory'],
+        security: [],
+        responses: {
+          '200': {
+            description: 'OK',
+            headers: {
+              'Cache-Control': {
+                schema: { type: 'string' },
+                description: 'Public edge-cache policy for global insights.',
+              },
+            },
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/GlobalInsightsResponse' },
+              },
+            },
+          },
+          '429': {
+            description: 'Insights rate limit exceeded',
+            headers: {
+              'Retry-After': {
+                schema: { type: 'integer' },
+                description: 'Seconds until the per-source limit resets.',
+              },
+            },
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/ErrorEnvelope' },
+              },
+            },
+          },
+        },
+      },
+    },
     '/api/v1/ops/dashboard': {
       get: {
         summary: 'Operations dashboard',
@@ -1095,6 +1651,14 @@ export const buildOpenApiSpec = () => ({
               },
             },
           },
+          '403': {
+            description: 'Forbidden; ops API key required',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/ErrorEnvelope' },
+              },
+            },
+          },
           '500': {
             description: 'Internal error',
             content: {
@@ -1121,6 +1685,14 @@ export const buildOpenApiSpec = () => ({
           },
           '401': {
             description: 'Unauthorized',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/ErrorEnvelope' },
+              },
+            },
+          },
+          '403': {
+            description: 'Forbidden; ops API key required',
             content: {
               'application/json': {
                 schema: { $ref: '#/components/schemas/ErrorEnvelope' },
@@ -1161,6 +1733,14 @@ export const buildOpenApiSpec = () => ({
           },
           '401': {
             description: 'Unauthorized',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/ErrorEnvelope' },
+              },
+            },
+          },
+          '403': {
+            description: 'Forbidden; ops API key required',
             content: {
               'application/json': {
                 schema: { $ref: '#/components/schemas/ErrorEnvelope' },

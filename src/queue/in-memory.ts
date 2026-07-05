@@ -1,4 +1,10 @@
-import type { JobQueue, QueueCountsMap, QueueJobPayload, RepeatableJobOptions } from './interfaces.js';
+import type {
+  JobQueue,
+  QueueCountsMap,
+  QueueJobPayload,
+  RedisMemorySnapshot,
+  RepeatableJobOptions,
+} from './interfaces.js';
 import { ALL_QUEUE_NAMES, DEFAULT_QUEUE_NAME, type QueueName } from './names.js';
 
 export class InMemoryJobQueue implements JobQueue {
@@ -35,6 +41,10 @@ export class InMemoryJobQueue implements JobQueue {
     // noop in memory — repeatable jobs are a BullMQ feature
   }
 
+  async removeRepeatables(_queueName: QueueName, _purpose: QueueJobPayload['purpose']): Promise<number> {
+    return 0;
+  }
+
   async consume(queueName: QueueName, handler: (payload: QueueJobPayload) => Promise<void>): Promise<void> {
     this.handlers.set(queueName, handler);
     await this.drain(queueName);
@@ -57,6 +67,10 @@ export class InMemoryJobQueue implements JobQueue {
       return [queueName, counts] as const;
     }));
     return Object.fromEntries(entries) as QueueCountsMap;
+  }
+
+  async getRedisMemorySnapshot(): Promise<RedisMemorySnapshot | null> {
+    return null;
   }
 
   async retryFailed(_queueName: QueueName, _limit: number): Promise<number> {

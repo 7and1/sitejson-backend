@@ -7,8 +7,8 @@ import {
 } from '../alternatives-cache.js';
 
 describe('alternatives durable cache helpers', () => {
-  it('uses a versioned rule-based cache key', () => {
-    expect(ALTERNATIVES_CACHE_ALGORITHM_VERSION).toBe('rule_based:v1');
+  it('uses a versioned semantic alternatives cache key', () => {
+    expect(ALTERNATIVES_CACHE_ALGORITHM_VERSION).toBe('semantic_embedding:v1');
   });
 
   it('normalizes cached item payloads and enforces the requested limit', () => {
@@ -19,7 +19,7 @@ describe('alternatives durable cache helpers', () => {
     ], 1);
 
     expect(parsed).toEqual({
-      algorithm: 'rule_based',
+      algorithm: 'semantic_embedding',
       items: [
         { domain: 'alt.com', title: 'Alt', rank: 1200, score: 0.91, reasons: ['same_category'] },
       ],
@@ -32,7 +32,7 @@ describe('alternatives durable cache helpers', () => {
 
   it('computes a bounded quality score from result items', () => {
     expect(computeAlternativesQualityScore({
-      algorithm: 'rule_based',
+      algorithm: 'semantic_embedding',
       items: [
         { domain: 'a.com', title: 'A', rank: 1, score: 0.4, reasons: [] },
         { domain: 'b.com', title: 'B', rank: 2, score: 1.2, reasons: [] },

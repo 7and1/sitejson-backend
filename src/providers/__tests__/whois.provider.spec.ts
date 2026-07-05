@@ -49,6 +49,46 @@ describe('WhoisProvider', () => {
     }
   });
 
+  it('deduplicates concurrent RDAP lookups for the same domain', async () => {
+    let rdapLookupCalls = 0;
+    vi.spyOn(http, 'fetchWithRetry').mockImplementation(async (url) => {
+      const href = String(url);
+      if (href.includes('data.iana.org/rdap/dns.json')) {
+        return new Response(JSON.stringify({ services: [] }));
+      }
+
+      if (href === 'https://rdap.org/domain/example.com') {
+        rdapLookupCalls += 1;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        return new Response(JSON.stringify({
+          events: [{ eventAction: 'registration', eventDate: '2021-02-03T00:00:00Z' }],
+          entities: [{
+            roles: ['registrar'],
+            vcardArray: ['vcard', [['fn', {}, 'text', 'Concurrent Registrar']]],
+          }],
+          nameservers: [{ ldhName: 'ns1.concurrent.test' }],
+          status: ['active'],
+        }));
+      }
+
+      throw new Error(`UNEXPECTED_URL:${href}`);
+    });
+
+    const provider = new WhoisProvider(options, 'SiteJSONTest/1.0');
+    const [first, second] = await Promise.all([
+      provider.run(context),
+      provider.run({ ...context, traceId: 'trc_whois_2' }),
+    ]);
+
+    expect(rdapLookupCalls).toBe(1);
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+    if (first.ok && second.ok) {
+      expect(first.data?.whois?.registrar).toBe('Concurrent Registrar');
+      expect(second.data?.whois?.registrar).toBe('Concurrent Registrar');
+    }
+  });
+
   it('returns empty snapshot for RDAP 404', async () => {
     vi.spyOn(http, 'fetchWithRetry').mockImplementation(async (url) => {
       if (url.includes('data.iana.org/rdap/dns.json')) {

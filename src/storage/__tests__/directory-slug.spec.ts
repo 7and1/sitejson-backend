@@ -52,6 +52,39 @@ describe('InMemorySiteRepository directory lookup', () => {
     expect(result.items[0]?.domain).toBe('example.com');
   });
 
+  it('drops blocked recrawls out of content-derived directory buckets', async () => {
+    const repo = new InMemorySiteRepository();
+
+    await repo.upsert({
+      domain: 'example.com',
+      updatedAt: '2026-07-04T00:00:00.000Z',
+      meta: { title: 'Example', techStackDetected: ['Next.js'] },
+      taxonomy: { iabCategory: 'Technology & Computing', tags: ['AI/ML'] },
+    });
+
+    await repo.upsert({
+      domain: 'example.com',
+      updatedAt: '2026-07-04T01:00:00.000Z',
+      visual: { screenshotUrl: 'https://cdn.example.com/blocked.webp' },
+      providerHealth: [
+        { provider: 'meta.provider', ok: false, errorCode: 'BOT_CHALLENGE_BLOCKED' },
+      ],
+      _meta: {
+        html: {
+          blocked: true,
+          source: 'browser',
+          length: 0,
+        },
+      },
+    });
+
+    const categoryResult = await repo.searchDirectory('category', 'technology-and-computing', 1, 24);
+    const techResult = await repo.searchDirectory('technology', 'nextjs', 1, 24);
+
+    expect(categoryResult.total).toBe(0);
+    expect(techResult.total).toBe(0);
+  });
+
   it('emits normalized slugs in directory summaries', async () => {
     const repo = new InMemorySiteRepository();
 

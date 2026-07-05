@@ -5,21 +5,23 @@ import type { QueueJobPayload } from '../queue/interfaces.js';
 import { createPostgresPool } from '../storage/postgres.js';
 
 interface EnqueueOptions {
-  dryRun: boolean;
+  apply: boolean;
   batchSize: number;
   limit: number;
 }
 
 const parseArgs = (): EnqueueOptions => {
   const options: EnqueueOptions = {
-    dryRun: false,
+    apply: false,
     batchSize: 500,
     limit: 10_000,
   };
 
   for (const arg of process.argv.slice(2)) {
-    if (arg === '--dry-run') {
-      options.dryRun = true;
+    if (arg === '--apply') {
+      options.apply = true;
+    } else if (arg === '--dry-run') {
+      options.apply = false;
     } else if (arg.startsWith('--batch=')) {
       const value = Number.parseInt(arg.split('=')[1] ?? '', 10);
       if (Number.isFinite(value) && value > 0) {
@@ -42,6 +44,7 @@ const CANDIDATE_WHERE = `
     OR jsonb_typeof(sp.report_json->'trafficData'->'whois') = 'null'
     OR (sp.report_json->'trafficData'->>'domainAgeYears') IS NULL
   )
+  AND (ct.next_whois_at IS NULL OR ct.next_whois_at <= NOW())
 `;
 
 const MS_PER_DAY = 86_400_000;
@@ -67,7 +70,7 @@ const main = async () => {
 
   const pool = createPostgresPool(env.DATABASE_URL);
   const queue = new BullMqJobQueue(
-    parseRedisUrl(env.REDIS_URL),
+    parseRedisUrl(env.REDIS_URL, env.REDIS_PASSWORD),
     env.QUEUE_NAME,
     {},
     env.QUEUE_CONCURRENCY,
@@ -77,12 +80,15 @@ const main = async () => {
     const countResult = await pool.query<{ count: string }>(
       `SELECT COUNT(*)::text AS count
        FROM site_profiles sp
+       LEFT JOIN crawl_targets ct ON ct.domain = sp.domain
        WHERE ${CANDIDATE_WHERE}`,
     );
     const totalCandidates = Number.parseInt(countResult.rows[0]?.count ?? '0', 10);
     console.log(`Domains missing whois/domainAge: ${totalCandidates}`);
+    console.log(`dry_run=${!options.apply}`);
 
-    if (options.dryRun || totalCandidates === 0) {
+    if (!options.apply || totalCandidates === 0) {
+      console.log(`would_enqueue=${Math.min(totalCandidates, options.limit)}`);
       return;
     }
 
@@ -102,6 +108,7 @@ const main = async () => {
         `
         SELECT sp.domain
         FROM site_profiles sp
+        LEFT JOIN crawl_targets ct ON ct.domain = sp.domain
         WHERE ${CANDIDATE_WHERE}
           AND sp.domain > $1
         ORDER BY sp.domain ASC

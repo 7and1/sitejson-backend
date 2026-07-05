@@ -46,6 +46,11 @@ export async function setupScheduledJobs(queue: JobQueue, logger: Logger, env: S
       purpose: 'ingest-auto-feed',
     });
     jobs.push(`ingest-auto-feed (${env.INGEST_AUTO_FEED_CRON || '*/5 * * * *'})`);
+  } else {
+    const removed = await queue.removeRepeatables(QUEUE_NAMES.ingest, 'ingest-auto-feed');
+    if (removed > 0) {
+      jobs.push(`ingest-auto-feed disabled (removed ${removed} legacy repeatable)`);
+    }
   }
 
   if (env.AI_RETRY_FEED_ENABLED) {
@@ -54,6 +59,11 @@ export async function setupScheduledJobs(queue: JobQueue, logger: Logger, env: S
       purpose: 'ai-retry-feed',
     });
     jobs.push(`ai-retry-feed (${env.AI_RETRY_FEED_CRON || '*/15 * * * *'})`);
+  } else {
+    const removed = await queue.removeRepeatables(QUEUE_NAMES.ingest, 'ai-retry-feed');
+    if (removed > 0) {
+      jobs.push(`ai-retry-feed disabled (removed ${removed} legacy repeatable)`);
+    }
   }
 
   logger.info({

@@ -196,4 +196,133 @@ describe('TrafficWorker', () => {
     expect(updatePatch.errorCount).toBe(2);
     expect(typeof updatePatch.nextTrafficAt).toBe('string');
   });
+
+  it('scopes monthly seed to due top-100k Radar domains with stable job ids', async () => {
+    const queue = {
+      enqueue: vi.fn(),
+      enqueueBulk: vi.fn(),
+      addRepeatable: vi.fn(),
+      consume: vi.fn(),
+      getCounts: vi.fn(),
+      getAllCounts: vi.fn(),
+      getRedisMemorySnapshot: vi.fn().mockResolvedValue(null),
+      retryFailed: vi.fn(),
+      healthCheck: vi.fn(),
+    };
+    const sites = {
+      getByDomain: vi.fn(),
+      upsert: vi.fn(),
+    };
+    const crawlTargets = {
+      getByDomain: vi.fn(),
+      update: vi.fn(),
+      getTopByRadarRank: vi.fn().mockResolvedValue([
+        { domain: 'a.com', radarRank: 10 },
+        { domain: 'b.com', radarRank: 100_000 },
+      ]),
+    };
+    const jobs = {
+      markRunning: vi.fn(),
+      markFailed: vi.fn(),
+    };
+    const orchestrator = {
+      analyze: vi.fn(),
+    };
+
+    const worker = new TrafficWorker(
+      queue as any,
+      sites as any,
+      crawlTargets as any,
+      jobs as any,
+      orchestrator as any,
+      noopLogger as any,
+      2,
+    );
+
+    await worker.process({
+      jobId: 'traffic-monthly-seed',
+      domain: '',
+      traceId: 'trc-seed',
+      phase: 'traffic',
+      purpose: 'traffic-monthly-seed',
+    });
+
+    expect(crawlTargets.getTopByRadarRank).toHaveBeenCalledWith(100_000, {
+      dueOnly: true,
+      maxRadarRank: 100_000,
+    });
+    expect(queue.enqueueBulk).toHaveBeenCalledTimes(1);
+    const payloads = queue.enqueueBulk.mock.calls[0][0];
+    expect(payloads.map((payload: { jobId: string }) => payload.jobId)).toEqual([
+      'traffic-monthly-a.com',
+      'traffic-monthly-b.com',
+    ]);
+    expect(payloads[0]).toMatchObject({ domain: 'a.com', delayMs: 0 });
+    expect(payloads[1]).toMatchObject({ domain: 'b.com', delayMs: 86_400_000 });
+  });
+
+  it('skips monthly seed when Redis memory is above the hard stop ratio', async () => {
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    };
+    const queue = {
+      enqueue: vi.fn(),
+      enqueueBulk: vi.fn(),
+      addRepeatable: vi.fn(),
+      consume: vi.fn(),
+      getCounts: vi.fn(),
+      getAllCounts: vi.fn(),
+      getRedisMemorySnapshot: vi.fn().mockResolvedValue({
+        usedBytes: 900,
+        maxBytes: 1000,
+        ratio: 0.9,
+      }),
+      retryFailed: vi.fn(),
+      healthCheck: vi.fn(),
+    };
+    const sites = {
+      getByDomain: vi.fn(),
+      upsert: vi.fn(),
+    };
+    const crawlTargets = {
+      getByDomain: vi.fn(),
+      update: vi.fn(),
+      getTopByRadarRank: vi.fn(),
+    };
+    const jobs = {
+      markRunning: vi.fn(),
+      markFailed: vi.fn(),
+    };
+    const orchestrator = {
+      analyze: vi.fn(),
+    };
+    const worker = new TrafficWorker(
+      queue as any,
+      sites as any,
+      crawlTargets as any,
+      jobs as any,
+      orchestrator as any,
+      logger as any,
+      2,
+    );
+
+    await worker.process({
+      jobId: 'traffic-monthly-seed',
+      domain: '',
+      traceId: 'trc-seed-memory',
+      phase: 'traffic',
+      purpose: 'traffic-monthly-seed',
+    });
+
+    expect(crawlTargets.getTopByRadarRank).not.toHaveBeenCalled();
+    expect(queue.enqueueBulk).not.toHaveBeenCalled();
+    expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({
+      event: 'monthly_seed_skipped_redis_memory',
+      redis_memory_ratio: 0.9,
+      hard_stop_ratio: 0.85,
+    }));
+  });
 });

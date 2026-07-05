@@ -3,9 +3,19 @@ import { buildApp } from './app.js';
 const SHUTDOWN_TIMEOUT_MS = 30000;
 
 const start = async () => {
-  const runtime = await buildApp();
+  const runtime = await buildApp(undefined, { runtimeRole: 'api' });
   await runtime.app.listen({ port: runtime.env.PORT, host: '0.0.0.0' });
   runtime.logger.info({ module: 'server', event: 'started', port: runtime.env.PORT });
+
+  // Warm the directory facet/stats caches in the background (does not block
+  // serving) so the first requests after a (re)deploy don't all run the slow
+  // aggregations at once and produce a cold-start burst of timeouts.
+  if (runtime.env.DIRECTORY_CACHE_PREWARM_ENABLED) {
+    void runtime.dependencies.sites
+      .prewarmDirectoryCaches({ topSlugsPerType: runtime.env.DIRECTORY_CACHE_PREWARM_TOP_SLUGS })
+      .then(() => runtime.logger.info({ module: 'server', event: 'directory_cache_prewarmed' }))
+      .catch((error) => runtime.logger.warn({ module: 'server', event: 'directory_cache_prewarm_failed', error: String(error) }));
+  }
 
   let isShuttingDown = false;
   const shutdown = async (signal: string) => {

@@ -64,7 +64,7 @@ const main = async () => {
 
   const pool = createPostgresPool(env.DATABASE_URL);
   const queue = new BullMqJobQueue(
-    parseRedisUrl(env.REDIS_URL),
+    parseRedisUrl(env.REDIS_URL, env.REDIS_PASSWORD),
     env.QUEUE_NAME,
     {},
     env.QUEUE_CONCURRENCY,

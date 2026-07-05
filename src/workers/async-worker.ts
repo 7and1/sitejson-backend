@@ -4,8 +4,28 @@ import type { JobQueue } from '../queue/interfaces.js';
 import { QUEUE_NAMES } from '../queue/names.js';
 import type { CrawlTargetRepository, JobRepository, SiteRepository } from '../storage/interfaces.js';
 import type { Orchestrator } from '../core/orchestrator.js';
-import { mergeSiteReports } from '../services/report-merge.js';
+import type { SiteReport } from '../core/types.js';
 import { buildAiSeedSignals } from '../services/ai-seed-signals.js';
+
+const DEFAULT_AUTHORITY_CACHE_TTL_HOURS = 720;
+
+const hasFreshAuthorityCache = (
+  report: SiteReport | null,
+  ttlHours: number,
+  nowMs = Date.now(),
+): boolean => {
+  const authority = report?.authority;
+  if (!authority?.fetchedAt || authority.source !== 'ahrefs') {
+    return false;
+  }
+
+  const fetchedAtMs = new Date(authority.fetchedAt).getTime();
+  if (Number.isNaN(fetchedAtMs)) {
+    return false;
+  }
+
+  return nowMs - fetchedAtMs < ttlHours * 60 * 60 * 1000;
+};
 
 export class AsyncWorker {
   constructor(
@@ -16,6 +36,7 @@ export class AsyncWorker {
     private readonly orchestrator: Orchestrator,
     private readonly logger: Logger,
     private readonly taxonomyPromptVersion = 1,
+    private readonly authorityCacheTtlHours = DEFAULT_AUTHORITY_CACHE_TTL_HOURS,
   ) {}
 
   async process(payload: QueueJobPayload): Promise<void> {
@@ -26,9 +47,24 @@ export class AsyncWorker {
         await this.jobs.markRunning(crawlJobId, 'async_running', 80);
       }
 
-      const previous = await this.sites.getByDomain(domain);
+      const [previous, crawlTarget] = await Promise.all([
+        this.sites.getByDomain(domain),
+        this.crawlTargets.getByDomain(domain),
+      ]);
       const aiSeedSignals = buildAiSeedSignals(domain, previous);
       const screenshotUrl = payload.screenshotUrl ?? previous?.visual?.screenshotUrl;
+      const skipAuthority = !payload.forceRefresh && hasFreshAuthorityCache(previous, this.authorityCacheTtlHours);
+
+      if (skipAuthority) {
+        this.logger.info({
+          trace_id: traceId,
+          domain,
+          module: 'async-worker',
+          event: 'authority_cache_hit',
+          cache_ttl_hours: this.authorityCacheTtlHours,
+          fetched_at: previous?.authority?.fetchedAt,
+        });
+      }
 
       const report = await this.orchestrator.analyze(domain, traceId, {
         phase: 'async',
@@ -37,9 +73,12 @@ export class AsyncWorker {
         aiReclassify: true,
         forceRefresh: payload.forceRefresh,
         skipAi: payload.skipAi,
+        skipAuthority,
+        isHighValue: crawlTarget?.isHighValue,
+        radarRank: crawlTarget?.radarRank,
       });
 
-      await this.sites.upsert(mergeSiteReports(previous, report));
+      await this.sites.upsert(report, { previousReport: previous });
       await this.crawlTargets.markLayerResult(domain, 'async', 'success');
 
       // Persist taxonomy if AI ran

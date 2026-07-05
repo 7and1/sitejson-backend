@@ -1,5 +1,9 @@
 import { setTimeout as sleep } from 'node:timers/promises';
-import { ProxyAgent, fetch as undiciFetch } from 'undici';
+import type { LookupFunction } from 'node:net';
+import { Agent, ProxyAgent, fetch as undiciFetch } from 'undici';
+import type { Dispatcher } from 'undici';
+import { resolvePublicAddresses } from '../services/network-safety.js';
+import { shuffleArray } from './anti-bot.js';
 
 export interface ProxyConfig {
   host: string;
@@ -70,6 +74,32 @@ const normalizeErrorCode = (error: unknown): string => {
 
 const MAX_RETRY_AFTER_MS = 120_000;
 const MAX_ROTATION_BACKOFF_MS = 60_000;
+const MAX_SAFE_REDIRECTS = 5;
+
+type ResolvedDirectUrl = {
+  parsed: URL;
+  addresses: string[];
+};
+
+class NonRetryableHttpError extends Error {
+  constructor(readonly status: number) {
+    super(`HTTP_${status}`);
+    this.name = 'NonRetryableHttpError';
+  }
+}
+
+const isNonRetryableHttpStatus = (status: number): boolean => (
+  status >= 400 && status < 500 && status !== 429
+);
+
+const createDeadlineSignal = (timeoutMs: number, existingSignal?: AbortSignal | null): AbortSignal => {
+  const timeoutSignal = AbortSignal.timeout(Math.max(1, Math.trunc(timeoutMs)));
+  if (!existingSignal) {
+    return timeoutSignal;
+  }
+
+  return AbortSignal.any([existingSignal, timeoutSignal]);
+};
 
 export const parseRetryAfterMs = (value: string | null | undefined, nowMs = Date.now()): number | null => {
   if (!value) return null;
@@ -302,7 +332,8 @@ export const getRandomProxy = (proxies: ProxyConfig[], exclude?: Set<string>): P
 };
 
 export const getRandomProxies = (proxies: ProxyConfig[], count: number): ProxyConfig[] => {
-  const shuffled = [...proxies].sort(() => Math.random() - 0.5);
+  const shuffled = [...proxies];
+  shuffleArray(shuffled);
   return shuffled.slice(0, Math.min(count, shuffled.length));
 };
 
@@ -311,38 +342,44 @@ const withTimeout = async (
   timeoutMs: number,
   init?: RequestInit,
   proxy?: ProxyConfig,
+  dispatcher?: Dispatcher,
 ) => {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const signal = createDeadlineSignal(timeoutMs, init?.signal);
 
-  try {
-    if (proxy) {
-      const proxyUrl = `http://${proxy.username}:${proxy.password}@${proxy.host}:${proxy.port}`;
-      const agent = new ProxyAgent(proxyUrl);
-      return await undiciFetch(url, {
-        ...init,
-        signal: controller.signal,
-        dispatcher: agent,
-      } as Parameters<typeof undiciFetch>[1]);
-    }
-
-    return await fetch(url, {
+  if (proxy) {
+    const proxyUrl = `http://${proxy.username}:${proxy.password}@${proxy.host}:${proxy.port}`;
+    const agent = new ProxyAgent(proxyUrl);
+    return await undiciFetch(url, {
       ...init,
-      signal: controller.signal,
-    });
-  } finally {
-    clearTimeout(timeout);
+      signal,
+      dispatcher: agent,
+    } as Parameters<typeof undiciFetch>[1]);
   }
+
+  if (dispatcher) {
+    return await undiciFetch(url, {
+      ...init,
+      signal,
+      dispatcher,
+    } as Parameters<typeof undiciFetch>[1]);
+  }
+
+  return await fetch(url, {
+    ...init,
+    signal,
+  });
 };
 
 export const fetchWithRetry = async (
   url: string,
   options: {
+    allowManualRedirect?: boolean;
     timeoutMs: number;
     retryAttempts: number;
     retryBaseMs: number;
     requestInit?: RequestInit;
     proxy?: ProxyConfig;
+    dispatcher?: Dispatcher;
   },
 ): Promise<Response> => {
   const maxAttempts = options.retryAttempts + 1;
@@ -350,7 +387,23 @@ export const fetchWithRetry = async (
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
-      const response = await withTimeout(url, options.timeoutMs, options.requestInit, options.proxy);
+      const response = await withTimeout(
+        url,
+        options.timeoutMs,
+        options.requestInit,
+        options.proxy,
+        options.dispatcher,
+      );
+      const isManualRedirect = !!options.allowManualRedirect
+        && response.status >= 300
+        && response.status < 400
+        && response.headers.has('location');
+      if (isManualRedirect) {
+        return response as Response;
+      }
+      if (isNonRetryableHttpStatus(response.status)) {
+        throw new NonRetryableHttpError(response.status);
+      }
       const isRetryable = response.status === 429 || response.status >= 500;
       if (!response.ok && isRetryable && attempt < maxAttempts) {
         const retryAfterMs = parseRetryAfterMs(response.headers.get('retry-after')) ?? 0;
@@ -367,6 +420,9 @@ export const fetchWithRetry = async (
       return response as Response;
     } catch (error) {
       lastError = error;
+      if (error instanceof NonRetryableHttpError) {
+        throw error;
+      }
       if (attempt < maxAttempts) {
         const backoffMs = options.retryBaseMs * 2 ** (attempt - 1);
         await sleep(backoffMs);
@@ -375,6 +431,165 @@ export const fetchWithRetry = async (
   }
 
   throw lastError instanceof Error ? lastError : new Error('FETCH_FAILED');
+};
+
+const getAddressFamily = (address: string): 4 | 6 => {
+  return address.includes(':') ? 6 : 4;
+};
+
+const createLookupMismatchError = (requested: string, expected: string): NodeJS.ErrnoException => {
+  const error = new Error(`SSRF_HOSTNAME_MISMATCH:${requested}:${expected}`) as NodeJS.ErrnoException;
+  error.code = 'SSRF_HOSTNAME_MISMATCH';
+  return error;
+};
+
+const createPinnedLookup = (hostname: string, addresses: string[]): LookupFunction => {
+  const expectedHostname = hostname.toLowerCase();
+  const pinnedAddresses = addresses.map((address) => ({
+    address,
+    family: getAddressFamily(address),
+  }));
+
+  return (requestedHostname, lookupOptions, callback) => {
+    if (requestedHostname.toLowerCase() !== expectedHostname) {
+      callback(createLookupMismatchError(requestedHostname, expectedHostname), '', 0);
+      return;
+    }
+
+    if (lookupOptions.all) {
+      callback(null, pinnedAddresses);
+      return;
+    }
+
+    const first = pinnedAddresses[0];
+    callback(null, first.address, first.family);
+  };
+};
+
+const createPinnedDispatcher = (hostname: string, addresses: string[]): Dispatcher => {
+  return new Agent({
+    connect: {
+      lookup: createPinnedLookup(hostname, addresses),
+    },
+  });
+};
+
+const closeDispatcher = (dispatcher: Dispatcher): void => {
+  void dispatcher.close().catch(() => undefined);
+};
+
+const responseWithDispatcherCleanup = (response: Response, dispatcher: Dispatcher): Response => {
+  if (!response.body) {
+    closeDispatcher(dispatcher);
+    return response;
+  }
+
+  const reader = response.body.getReader();
+  let closed = false;
+  const closeOnce = () => {
+    if (closed) {
+      return;
+    }
+    closed = true;
+    closeDispatcher(dispatcher);
+  };
+
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) {
+          closeOnce();
+          controller.close();
+          return;
+        }
+        controller.enqueue(value);
+      } catch (error) {
+        closeOnce();
+        controller.error(error);
+      }
+    },
+    async cancel(reason) {
+      closeOnce();
+      await reader.cancel(reason);
+    },
+  });
+
+  return new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+};
+
+const assertSafeDirectUrl = async (rawUrl: string): Promise<ResolvedDirectUrl> => {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw new Error('SSRF_INVALID_URL');
+  }
+
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    throw new Error('SSRF_BLOCKED_SCHEME');
+  }
+
+  if (parsed.username || parsed.password) {
+    throw new Error('SSRF_BLOCKED_CREDENTIALS');
+  }
+
+  const addresses = await resolvePublicAddresses(parsed.hostname);
+  return { parsed, addresses };
+};
+
+export const fetchDirectWithSafeRedirects = async (
+  url: string,
+  options: {
+    timeoutMs: number;
+    retryAttempts: number;
+    retryBaseMs: number;
+    requestInit?: RequestInit;
+  },
+): Promise<Response> => {
+  let currentUrl = url;
+
+  for (let redirectCount = 0; redirectCount <= MAX_SAFE_REDIRECTS; redirectCount += 1) {
+    const { parsed: parsedUrl, addresses } = await assertSafeDirectUrl(currentUrl);
+    const dispatcher = createPinnedDispatcher(parsedUrl.hostname, addresses);
+    let response: Response;
+    try {
+      response = await fetchWithRetry(parsedUrl.toString(), {
+        allowManualRedirect: true,
+        timeoutMs: options.timeoutMs,
+        retryAttempts: options.retryAttempts,
+        retryBaseMs: options.retryBaseMs,
+        dispatcher,
+        requestInit: {
+          ...options.requestInit,
+          redirect: 'manual',
+        },
+      });
+    } catch (error) {
+      closeDispatcher(dispatcher);
+      throw error;
+    }
+
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get('location');
+      if (!location) {
+        closeDispatcher(dispatcher);
+        throw new Error(`HTTP_${response.status}`);
+      }
+
+      closeDispatcher(dispatcher);
+      currentUrl = new URL(location, parsedUrl).toString();
+      continue;
+    }
+
+    return responseWithDispatcherCleanup(response as Response, dispatcher);
+  }
+
+  throw new Error('SSRF_TOO_MANY_REDIRECTS');
 };
 
 export const fetchWithProxyRotation = async (
@@ -424,6 +639,9 @@ export const fetchWithProxyRotation = async (
       isDirect: true,
     }));
     if (!response.ok) {
+      if (isNonRetryableHttpStatus(response.status)) {
+        throw new NonRetryableHttpError(response.status);
+      }
       throw new Error(`HTTP_${response.status}`);
     }
     return response as Response;
@@ -450,6 +668,9 @@ export const fetchWithProxyRotation = async (
       );
       if (!response.ok) {
         const status = response.status;
+        if (isNonRetryableHttpStatus(status)) {
+          throw new NonRetryableHttpError(status);
+        }
         const retryAfterMs = (status === 429 || status === 503)
           ? parseRetryAfterMs(response.headers.get('retry-after'))
           : null;
@@ -471,6 +692,9 @@ export const fetchWithProxyRotation = async (
       return response as Response;
     } catch (error) {
       lastError = error;
+      if (error instanceof NonRetryableHttpError) {
+        throw error;
+      }
 
       if (index < allProxies.length - 1) {
         const backoffMs = computeRotationBackoffMs({
@@ -491,6 +715,9 @@ export const fetchWithProxyRotation = async (
       isDirect: true,
     }));
     if (!response.ok) {
+      if (isNonRetryableHttpStatus(response.status)) {
+        throw new NonRetryableHttpError(response.status);
+      }
       throw new Error(`HTTP_${response.status}`);
     }
     return response as Response;
@@ -660,7 +887,7 @@ const fetchViaDirect = async (
     userAgent: string;
   },
 ): Promise<string> => {
-  const response = await fetchWithRetry(url, {
+  const response = await fetchDirectWithSafeRedirects(url, {
     timeoutMs: options.timeoutMs,
     retryAttempts: options.retryAttempts,
     retryBaseMs: options.retryBaseMs,
@@ -669,7 +896,6 @@ const fetchViaDirect = async (
         'user-agent': options.userAgent,
         accept: 'text/html,application/xhtml+xml',
       },
-      redirect: 'follow',
     },
   });
 
@@ -788,8 +1014,9 @@ export const fetchHtmlWithFallbackChain = async (
   return null;
 };
 
-const selectUniqueIpProxies = (proxies: ProxyConfig[], count: number): ProxyConfig[] => {
-  const shuffled = [...proxies].sort(() => Math.random() - 0.5);
+export const selectUniqueIpProxies = (proxies: ProxyConfig[], count: number): ProxyConfig[] => {
+  const shuffled = [...proxies];
+  shuffleArray(shuffled);
   const selected: ProxyConfig[] = [];
   const usedIps = new Set<string>();
 

@@ -22,6 +22,9 @@ export interface FilesData {
 
 export interface DnsData {
   provider: string;
+  aRecords: string[];
+  aaaaRecords: string[];
+  caaRecords: string[];
   mxRecords: string[];
   nsRecords: string[];
   txtRecords: string[];
@@ -49,6 +52,14 @@ export interface PublisherData {
   directCount: number;
   resellerCount: number;
   monetizationSignals: string[];
+}
+
+export interface AuthorityData {
+  domainRating: number | null;
+  source: 'ahrefs';
+  licenseUrl: string;
+  attribution: 'Domain Rating by Ahrefs';
+  fetchedAt: string;
 }
 
 export interface RadarData {
@@ -105,6 +116,9 @@ export interface TrafficData {
   pagesPerVisit: number | null;
   dataYear: string | null;
   dataMonth: string | null;
+  isStale: boolean | null;
+  dataAgeDays: number | null;
+  snapshotDate: string | null;
   trafficSources: {
     direct: number;
     search: number;
@@ -154,6 +168,9 @@ const filesSchema = z.object({
 
 const dnsSchema = z.object({
   provider: z.string(),
+  aRecords: z.array(z.string()),
+  aaaaRecords: z.array(z.string()),
+  caaRecords: z.array(z.string()),
   mxRecords: z.array(z.string()),
   nsRecords: z.array(z.string()),
   txtRecords: z.array(z.string()),
@@ -181,6 +198,14 @@ const publisherSchema = z.object({
   directCount: z.number(),
   resellerCount: z.number(),
   monetizationSignals: z.array(z.string()),
+});
+
+const authoritySchema = z.object({
+  domainRating: z.number().min(0).max(100).nullable(),
+  source: z.literal('ahrefs'),
+  licenseUrl: z.string().url(),
+  attribution: z.literal('Domain Rating by Ahrefs'),
+  fetchedAt: z.string(),
 });
 
 const radarSchema = z.object({
@@ -237,6 +262,9 @@ const trafficSchema = z.object({
   pagesPerVisit: z.number().nullable(),
   dataYear: z.string().nullable(),
   dataMonth: z.string().nullable(),
+  isStale: z.boolean().nullable(),
+  dataAgeDays: z.number().nullable(),
+  snapshotDate: z.string().nullable(),
   trafficSources: z.object({
     direct: z.number(),
     search: z.number(),
@@ -291,6 +319,11 @@ export const parseAdsData = (value: unknown): AdsData | null => {
 export const parsePublisherData = (value: unknown): PublisherData | null => {
   const parsed = publisherSchema.safeParse(value);
   return parsed.success ? (parsed.data as PublisherData) : null;
+};
+
+export const parseAuthorityData = (value: unknown): AuthorityData | null => {
+  const parsed = authoritySchema.safeParse(value);
+  return parsed.success ? (parsed.data as AuthorityData) : null;
 };
 
 export const parseRadarData = (value: unknown): RadarData | null => {

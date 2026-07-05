@@ -6,6 +6,7 @@ export const analyzeRequestSchema = z.object({
   force_ai: z.boolean().optional(),
   skip_ai: z.boolean().optional(),
   priority: z.enum(['normal', 'high']).optional(),
+  webhook_url: z.string().url().optional(),
 });
 
 export const directoryParamsSchema = z.object({

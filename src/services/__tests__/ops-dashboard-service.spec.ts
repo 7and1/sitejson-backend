@@ -55,6 +55,33 @@ describe('OpsDashboardService', () => {
     expect(data.quality.traffic_coverage).toBe(0);
     expect(data.recent_items.length).toBe(2);
     expect(data.recent_items.find((item) => item.job_id === 'job_failed')?.error_message).toBe('network error');
+    expect(data.alerts).toEqual([]);
     expect(data.queue_by_type?.browser_realtime).toBeDefined();
+  });
+
+  it('emits queue alerts when failed jobs are present', async () => {
+    const jobs = new InMemoryJobRepository();
+    const queue = new InMemoryJobQueue();
+
+    queue.getAllCounts = async () => ({
+      ingest: { waiting: 0, active: 0, completed: 0, failed: 0, delayed: 0, prioritized: 0 },
+      browser_realtime: { waiting: 0, active: 0, completed: 0, failed: 0, delayed: 0, prioritized: 0 },
+      browser: { waiting: 0, active: 0, completed: 0, failed: 3, delayed: 0, prioritized: 0 },
+      async: { waiting: 0, active: 0, completed: 0, failed: 1, delayed: 0, prioritized: 0 },
+      radar: { waiting: 0, active: 0, completed: 0, failed: 0, delayed: 0, prioritized: 0 },
+      traffic: { waiting: 0, active: 0, completed: 0, failed: 0, delayed: 0, prioritized: 0 },
+      whois: { waiting: 0, active: 0, completed: 0, failed: 0, delayed: 0, prioritized: 0 },
+    });
+
+    const service = new OpsDashboardService(jobs, queue);
+    const data = await service.getDashboard({
+      window: '1h',
+      recentLimit: 10,
+    });
+
+    expect(data.alerts).toEqual([
+      expect.objectContaining({ queue: 'browser', failed: 3 }),
+      expect.objectContaining({ queue: 'async', failed: 1 }),
+    ]);
   });
 });

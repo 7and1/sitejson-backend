@@ -1,13 +1,13 @@
 # Provider Data Reference
 
-11 providers, 5 worker phases. Each provider implements `Provider<T>` and returns a `ProviderResult<T>`.
+12 providers, 5 worker phases. Each provider implements `Provider<T>` and returns a `ProviderResult<T>`.
 
 ## Provider → Phase Mapping
 
 | Phase | Queue | Providers |
 |-------|-------|-----------|
 | browser | `browser` | Visual, Meta, Seo, Ai |
-| async | `async` | Dns, Ads, Publisher, Files |
+| async | `async` | Dns, Ads, Publisher, Files, Authority (optional) |
 | traffic | `traffic` | Traffic |
 | whois | `whois` | Whois |
 | radar | `radar` | Radar |
@@ -106,7 +106,21 @@ File: `src/providers/files.provider.ts`
 
 robots.txt fetched via GET (up to 64KB) and parsed for `Sitemap:` directives. sitemap.xml checked via HEAD with GET fallback.
 
-### 8. TrafficProvider
+### 8. AhrefsDomainRatingProvider
+
+File: `src/providers/authority.provider.ts`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| domainRating | number \| null | Ahrefs Domain Rating, 0-100 |
+| source | `'ahrefs'` | Upstream source identifier |
+| licenseUrl | string | Ahrefs Domain Rating license URL |
+| attribution | `'Domain Rating by Ahrefs'` | Required adjacent attribution text |
+| fetchedAt | string | ISO timestamp for the fetch |
+
+Feature-flagged by `AHREFS_DR_ENABLED=true` and defaults to disabled. The async worker reuses existing `report.authority.fetchedAt` for `AHREFS_DR_CACHE_TTL_HOURS` (default 720h / 30d); `forceRefresh` bypasses that cache. Public UI/API consumers must keep the `Domain Rating by Ahrefs` attribution link adjacent to the value.
+
+### 9. TrafficProvider
 
 File: `src/providers/traffic.provider.ts`
 
@@ -127,7 +141,7 @@ File: `src/providers/traffic.provider.ts`
 
 5-source waterfall: SimilarWeb API → traffic.cv rotation → FlareSolverr → ProxyGrid → SOAX.
 
-### 9. WhoisProvider
+### 10. WhoisProvider
 
 File: `src/providers/whois.provider.ts`
 
@@ -143,7 +157,7 @@ File: `src/providers/whois.provider.ts`
 
 RDAP lookup chain: rdap.org → hardcoded TLD servers → IANA bootstrap (24h cache).
 
-### 10. RadarProvider
+### 11. RadarProvider
 
 File: `src/providers/radar.provider.ts`
 
@@ -155,7 +169,7 @@ File: `src/providers/radar.provider.ts`
 | sourceTimestamp | string? | Data timestamp |
 | queued | boolean | Whether a single-domain API refresh was queued |
 
-### 11. AiProvider
+### 12. AiProvider
 
 File: `src/providers/ai.provider.ts`
 
@@ -180,6 +194,7 @@ File: `src/providers/ai.provider.ts`
 | Worker | Success TTL | Failure TTL | Force Refresh |
 |--------|-------------|-------------|---------------|
 | BrowserWorker | freshness_ttl_sec (default 7d) | exponential backoff | via `forceRefresh` |
+| AsyncWorker authority.provider | `AHREFS_DR_CACHE_TTL_HOURS` (default 720h) | providerHealth error only | via `forceRefresh` |
 | TrafficWorker | 168h (7d) | exponential backoff capped at 720h | via `forceRefresh` |
 | WhoisWorker | 720h (30d) | `168h * 2^(errorCount-1)` capped at 720h | via `forceRefresh` |
 | RadarSyncWorker | N/A (bulk sync) | N/A | N/A |

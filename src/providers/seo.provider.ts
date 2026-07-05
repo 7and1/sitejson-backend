@@ -1,7 +1,7 @@
 import type { CrawlContext } from '../core/types.js';
 import { providerFailure, providerSuccess } from './base.js';
 import type { Provider } from './base.js';
-import { fetchWithRetry, readBoundedText } from './http.js';
+import { fetchDirectWithSafeRedirects, readBoundedText } from './http.js';
 import { parseHtmlSignals } from './html.js';
 import type { ProviderRuntimeOptions, SeoData } from './types.js';
 
@@ -16,6 +16,15 @@ export class SeoProvider implements Provider<SeoData> {
   async run(ctx: CrawlContext) {
     const startedAt = Date.now();
     try {
+      if (ctx.metadata?.blocked) {
+        return providerFailure(
+          this.name,
+          startedAt,
+          'BOT_CHALLENGE_BLOCKED',
+          'Page content was blocked by an anti-bot interstitial',
+        );
+      }
+
       if (ctx.browser?.page) {
         const browserData = await ctx.browser.page.evaluate(() => {
           const doc = (globalThis as { document?: any }).document;
@@ -89,7 +98,7 @@ export class SeoProvider implements Provider<SeoData> {
   }
 
   private async fetchHtml(url: string): Promise<string> {
-    const response = await fetchWithRetry(url, {
+    const response = await fetchDirectWithSafeRedirects(url, {
       timeoutMs: this.options.timeoutMs ?? 15000,
       retryAttempts: this.options.retryAttempts ?? 2,
       retryBaseMs: this.options.retryBaseMs ?? 250,
@@ -98,7 +107,6 @@ export class SeoProvider implements Provider<SeoData> {
           'user-agent': this.userAgent,
           accept: 'text/html,application/xhtml+xml',
         },
-        redirect: 'follow',
       },
     });
     return readBoundedText(response);

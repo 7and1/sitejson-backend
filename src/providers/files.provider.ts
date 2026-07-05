@@ -1,6 +1,7 @@
 import type { CrawlContext } from '../core/types.js';
 import { providerFailure, providerSuccess } from './base.js';
 import type { Provider } from './base.js';
+import { fetchDirectWithSafeRedirects, readBoundedText } from './http.js';
 import type { FilesData, ProviderRuntimeOptions } from './types.js';
 
 const extractSitemapUrls = (robotsTxt: string): string[] => {
@@ -49,21 +50,18 @@ export class FilesProvider implements Provider<FilesData> {
   }
 
   private async fetchRobotsTxt(url: string): Promise<{ exists: boolean; sitemapUrls: string[] }> {
-    const controller = new AbortController();
-    const timeout = setTimeout(
-      () => controller.abort(),
-      this.options.timeoutMs ?? 5000,
-    );
-
     try {
-      const response = await fetch(url, {
-        method: 'GET',
-        headers: {
-          'user-agent': this.userAgent,
-          range: 'bytes=0-65535',
+      const response = await fetchDirectWithSafeRedirects(url, {
+        timeoutMs: this.options.timeoutMs ?? 5000,
+        retryAttempts: this.options.retryAttempts ?? 1,
+        retryBaseMs: this.options.retryBaseMs ?? 250,
+        requestInit: {
+          method: 'GET',
+          headers: {
+            'user-agent': this.userAgent,
+            range: 'bytes=0-65535',
+          },
         },
-        signal: controller.signal,
-        redirect: 'follow',
       });
 
       if (!response.ok) return { exists: false, sitemapUrls: [] };
@@ -71,33 +69,28 @@ export class FilesProvider implements Provider<FilesData> {
       const contentType = response.headers.get('content-type') ?? '';
       if (contentType.includes('text/html')) return { exists: false, sitemapUrls: [] };
 
-      const text = await response.text();
+      const text = await readBoundedText(response, 65536);
       return {
         exists: true,
         sitemapUrls: extractSitemapUrls(text),
       };
     } catch {
       return { exists: false, sitemapUrls: [] };
-    } finally {
-      clearTimeout(timeout);
     }
   }
 
   private async checkFileExists(url: string): Promise<boolean> {
-    const controller = new AbortController();
-    const timeout = setTimeout(
-      () => controller.abort(),
-      this.options.timeoutMs ?? 5000,
-    );
-
     try {
-      const headResponse = await fetch(url, {
-        method: 'HEAD',
-        headers: {
-          'user-agent': this.userAgent,
+      const headResponse = await fetchDirectWithSafeRedirects(url, {
+        timeoutMs: this.options.timeoutMs ?? 5000,
+        retryAttempts: this.options.retryAttempts ?? 1,
+        retryBaseMs: this.options.retryBaseMs ?? 250,
+        requestInit: {
+          method: 'HEAD',
+          headers: {
+            'user-agent': this.userAgent,
+          },
         },
-        signal: controller.signal,
-        redirect: 'follow',
       });
 
       if (headResponse.ok) {
@@ -105,14 +98,17 @@ export class FilesProvider implements Provider<FilesData> {
       }
 
       if (headResponse.status === 405 || headResponse.status === 403) {
-        const getResponse = await fetch(url, {
-          method: 'GET',
-          headers: {
-            'user-agent': this.userAgent,
-            range: 'bytes=0-255',
+        const getResponse = await fetchDirectWithSafeRedirects(url, {
+          timeoutMs: this.options.timeoutMs ?? 5000,
+          retryAttempts: this.options.retryAttempts ?? 1,
+          retryBaseMs: this.options.retryBaseMs ?? 250,
+          requestInit: {
+            method: 'GET',
+            headers: {
+              'user-agent': this.userAgent,
+              range: 'bytes=0-255',
+            },
           },
-          signal: controller.signal,
-          redirect: 'follow',
         });
         return getResponse.ok;
       }
@@ -120,8 +116,6 @@ export class FilesProvider implements Provider<FilesData> {
       return false;
     } catch {
       return false;
-    } finally {
-      clearTimeout(timeout);
     }
   }
 }

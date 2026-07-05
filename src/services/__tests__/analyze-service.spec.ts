@@ -1,14 +1,43 @@
-import { describe, expect, it } from 'vitest';
+import { domainToASCII } from 'node:url';
+import { describe, expect, it, vi } from 'vitest';
 import { InMemoryJobQueue } from '../../queue/in-memory.js';
-import { createLogger } from '../../observability/logger.js';
 import { AnalyzeService } from '../analyze-service.js';
 import { InMemoryCrawlTargetRepository, InMemoryJobRepository, InMemorySiteRepository } from '../../storage/in-memory.js';
 import type { QueueJobPayload } from '../../queue/interfaces.js';
 import type { QueueName } from '../../queue/names.js';
+import { QueueCapacityError } from '../../queue/errors.js';
+
+vi.mock('../domain.js', () => ({
+  normalizeDomain: (input: string) => {
+    const normalized = input.trim().toLowerCase();
+    if (!normalized || /\s/.test(normalized)) {
+      throw new Error('INVALID_DOMAIN');
+    }
+    const ascii = domainToASCII(normalized);
+    if (!ascii) {
+      throw new Error('INVALID_DOMAIN');
+    }
+    return ascii;
+  },
+}));
+
+const noopLogger = {
+  info() {},
+  warn() {},
+  error() {},
+  debug() {},
+  fatal() {},
+};
 
 class FailingEnqueueQueue extends InMemoryJobQueue {
   async enqueue(_payload: QueueJobPayload, _queueName?: QueueName): Promise<void> {
     throw new Error('QUEUE_DOWN');
+  }
+}
+
+class OomEnqueueQueue extends InMemoryJobQueue {
+  async enqueue(_payload: QueueJobPayload, _queueName?: QueueName): Promise<void> {
+    throw new QueueCapacityError("OOM command not allowed when used memory > 'maxmemory'.");
   }
 }
 
@@ -18,7 +47,7 @@ describe('AnalyzeService', () => {
     const sites = new InMemorySiteRepository();
     const crawlTargets = new InMemoryCrawlTargetRepository();
     const queue = new InMemoryJobQueue();
-    const service = new AnalyzeService(jobs, sites, crawlTargets, queue, createLogger('error'), 3600, 1, false);
+    const service = new AnalyzeService(jobs, sites, crawlTargets, queue, noopLogger as any, 3600, 1, false);
 
     await sites.upsert({
       domain: 'example.com',
@@ -37,7 +66,7 @@ describe('AnalyzeService', () => {
     const sites = new InMemorySiteRepository();
     const crawlTargets = new InMemoryCrawlTargetRepository();
     const queue = new InMemoryJobQueue();
-    const service = new AnalyzeService(jobs, sites, crawlTargets, queue, createLogger('error'), 1, 1, false);
+    const service = new AnalyzeService(jobs, sites, crawlTargets, queue, noopLogger as any, 1, 1, false);
 
     await sites.upsert({
       domain: 'example.com',
@@ -57,7 +86,7 @@ describe('AnalyzeService', () => {
     const sites = new InMemorySiteRepository();
     const crawlTargets = new InMemoryCrawlTargetRepository();
     const queue = new InMemoryJobQueue();
-    const service = new AnalyzeService(jobs, sites, crawlTargets, queue, createLogger('error'), 1, 2, true);
+    const service = new AnalyzeService(jobs, sites, crawlTargets, queue, noopLogger as any, 1, 2, true);
 
     const first = await service.schedule('example.com', true, false, 'normal');
     const second = await service.schedule('example.com', true, false, 'normal');
@@ -76,7 +105,7 @@ describe('AnalyzeService', () => {
     const sites = new InMemorySiteRepository();
     const crawlTargets = new InMemoryCrawlTargetRepository();
     const queue = new InMemoryJobQueue();
-    const service = new AnalyzeService(jobs, sites, crawlTargets, queue, createLogger('error'), 1, 7, true);
+    const service = new AnalyzeService(jobs, sites, crawlTargets, queue, noopLogger as any, 1, 7, true);
 
     const result = await service.schedule('example.com', true, false, 'normal');
     expect(result.accepted).toBe(true);
@@ -91,20 +120,50 @@ describe('AnalyzeService', () => {
     expect(captured.taxonomyPromptVersion).toBe(7);
   });
 
+  it('passes webhook_url through to the queue payload', async () => {
+    const jobs = new InMemoryJobRepository();
+    const sites = new InMemorySiteRepository();
+    const crawlTargets = new InMemoryCrawlTargetRepository();
+    const queue = new InMemoryJobQueue();
+    const service = new AnalyzeService(jobs, sites, crawlTargets, queue, noopLogger as any, 1, 7, true);
+
+    const result = await service.schedule('example.com', true, false, 'normal', true, 'https://hooks.example.com/sitejson');
+    expect(result.accepted).toBe(true);
+
+    let captured: any;
+    await queue.consume('ingest', async (payload) => {
+      captured = payload;
+    });
+
+    expect(captured.webhookUrl).toBe('https://hooks.example.com/sitejson');
+  });
+
   it('marks job failed when enqueue throws and allows later retry', async () => {
     const jobs = new InMemoryJobRepository();
     const sites = new InMemorySiteRepository();
     const crawlTargets = new InMemoryCrawlTargetRepository();
-    const service = new AnalyzeService(jobs, sites, crawlTargets, new FailingEnqueueQueue(), createLogger('error'), 1, 1, false);
+    const service = new AnalyzeService(jobs, sites, crawlTargets, new FailingEnqueueQueue(), noopLogger as any, 1, 1, false);
 
     await expect(service.schedule('example.com', true, false, 'normal')).rejects.toThrow('QUEUE_DOWN');
 
     const failedJob = await jobs.findRunningByDomain('example.com');
     expect(failedJob).toBeNull();
 
-    const retryService = new AnalyzeService(jobs, sites, crawlTargets, new InMemoryJobQueue(), createLogger('error'), 1, 1, false);
+    const retryService = new AnalyzeService(jobs, sites, crawlTargets, new InMemoryJobQueue(), noopLogger as any, 1, 1, false);
     const retried = await retryService.schedule('example.com', true, false, 'normal');
     expect(retried.accepted).toBe(true);
     expect(retried.reason).toBe('QUEUED');
+  });
+
+  it('preserves QueueCapacityError when realtime enqueue is capacity-blocked', async () => {
+    const jobs = new InMemoryJobRepository();
+    const sites = new InMemorySiteRepository();
+    const crawlTargets = new InMemoryCrawlTargetRepository();
+    const service = new AnalyzeService(jobs, sites, crawlTargets, new OomEnqueueQueue(), noopLogger as any, 1, 1, false);
+
+    await expect(service.schedule('example.com', true, false, 'normal')).rejects.toBeInstanceOf(QueueCapacityError);
+
+    const failedJob = Array.from(((jobs as any).jobs as Map<string, unknown>).values())[0] as { stage?: string } | undefined;
+    expect(failedJob?.stage).toBe('enqueue_failed');
   });
 });

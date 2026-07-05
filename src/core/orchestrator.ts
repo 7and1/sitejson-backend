@@ -1,4 +1,3 @@
-import { promises as dns } from 'node:dns';
 import { chromium } from 'playwright';
 import type { Browser, BrowserContext as PlaywrightBrowserContext, Page } from 'playwright';
 import type { Logger } from '../observability/logger.js';
@@ -6,6 +5,7 @@ import type { CrawlContext, HtmlSignals, ProviderResult, SiteReport } from './ty
 import type { Provider } from '../providers/base.js';
 import {
   parseAdsData,
+  parseAuthorityData,
   parseAiData,
   parseDnsData,
   parseFilesData,
@@ -19,10 +19,13 @@ import {
 } from '../providers/types.js';
 import {
   buildFetchTraceEntry,
+  fetchDirectWithSafeRedirects,
   fetchHtmlWithFallbackChain,
   type FetchTrace,
 } from '../providers/http.js';
+import { looksBlocked } from '../providers/anti-bot.js';
 import { parseHtmlSignals } from '../providers/html.js';
+import { resolvePublicAddresses } from '../services/network-safety.js';
 
 /** Hard cap on HTML stored in context — prevents event-loop blocking during signal extraction. */
 const MAX_HTML_BYTES = 2 * 1024 * 1024; // 2 MB
@@ -59,6 +62,8 @@ const toRankBucket = (rank: number | null | undefined): string | undefined => {
 
 type RuntimeOptions = {
   timeoutMs: number;
+  providerQuickTimeoutMs: number;
+  aiTimeoutMs: number;
   retryAttempts: number;
   retryBaseMs: number;
   userAgent: string;
@@ -67,6 +72,7 @@ type RuntimeOptions = {
   browserEnabled: boolean;
   browserTimeoutMs: number;
   browserHighValueTimeoutMs: number;
+  browserNetworkIdleTimeoutMs: number;
   browserViewport: { width: number; height: number };
   proxyGridBaseUrl?: string;
   proxyGridSecret?: string;
@@ -74,6 +80,33 @@ type RuntimeOptions = {
   soaxApiSecret?: string;
   soaxCountry?: string;
   soaxProxyType?: number;
+};
+
+const QUICK_DEADLINE_PROVIDERS = new Set([
+  'meta.provider',
+  'seo.provider',
+  'dns.provider',
+  'files.provider',
+  'ads.provider',
+  'publisher.provider',
+]);
+
+export const resolveProviderDeadlineMs = (
+  providerName: string,
+  runtimeOptions: Pick<RuntimeOptions, 'timeoutMs' | 'providerQuickTimeoutMs' | 'aiTimeoutMs'>,
+): number => {
+  if (providerName === 'ai.provider') {
+    return Math.max(1, Math.trunc(runtimeOptions.aiTimeoutMs));
+  }
+
+  if (QUICK_DEADLINE_PROVIDERS.has(providerName)) {
+    return Math.max(1, Math.min(
+      Math.trunc(runtimeOptions.timeoutMs),
+      Math.trunc(runtimeOptions.providerQuickTimeoutMs),
+    ));
+  }
+
+  return Math.max(1, Math.trunc(runtimeOptions.timeoutMs));
 };
 
 type AnalyzeOptions = {
@@ -85,6 +118,7 @@ type AnalyzeOptions = {
   isHighValue?: boolean;
   radarRank?: number;
   skipAi?: boolean;
+  skipAuthority?: boolean;
   screenshotUrl?: string;
 };
 
@@ -97,6 +131,7 @@ const BROWSER_PROVIDER_SET = new Set([
 const ASYNC_PROVIDER_SET = new Set([
   'dns.provider',
   'ads.provider',
+  'authority.provider',
   'publisher.provider',
   'files.provider',
   'ai.provider',
@@ -113,6 +148,105 @@ const WHOIS_PROVIDER_SET = new Set([
 const RADAR_PROVIDER_SET = new Set([
   'radar.provider',
 ]);
+
+type BrowserRequestSafetyCache = Map<string, Promise<boolean>>;
+
+const SAFE_BROWSER_LOCAL_SCHEMES = new Set(['about:', 'blob:', 'data:']);
+
+const getHostnameForLog = (rawUrl: string): string => {
+  try {
+    const parsed = new URL(rawUrl);
+    return parsed.hostname || parsed.protocol.replace(':', '');
+  } catch {
+    return 'invalid-url';
+  }
+};
+
+const applySafeHtmlToContext = (
+  context: CrawlContext,
+  input: {
+    html: string;
+    source: NonNullable<NonNullable<CrawlContext['metadata']>['htmlSource']>;
+    status?: number;
+  },
+): boolean => {
+  if (looksBlocked(input.status ?? 200, input.html)) {
+    context.html = undefined;
+    context.htmlSignals = undefined;
+    context.metadata = {
+      ...context.metadata,
+      htmlSource: input.source,
+      blocked: true,
+    };
+    return false;
+  }
+
+  context.html = truncateHtml(input.html);
+  context.htmlSignals = parseHtmlSignals(context.html);
+  context.metadata = {
+    ...context.metadata,
+    htmlSource: input.source,
+    blocked: false,
+  };
+  return true;
+};
+
+const isIpv4Address = (value: string): boolean => /^\d{1,3}(?:\.\d{1,3}){3}$/.test(value);
+const isIpv6Address = (value: string): boolean => value.includes(':');
+
+export const buildPinnedHostResolverRules = (
+  hostname: string,
+  addresses: string[],
+): string | null => {
+  const preferredAddress = addresses.find((address) => isIpv4Address(address) || isIpv6Address(address));
+  if (!preferredAddress) {
+    return null;
+  }
+
+  const mappedAddress = isIpv6Address(preferredAddress)
+    ? `[${preferredAddress}]`
+    : preferredAddress;
+
+  return [
+    `MAP ${hostname} ${mappedAddress}`,
+    'EXCLUDE localhost',
+  ].join(', ');
+};
+
+export const shouldAllowBrowserRequestUrl = async (
+  rawUrl: string,
+  cache: BrowserRequestSafetyCache,
+): Promise<boolean> => {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return false;
+  }
+
+  if (SAFE_BROWSER_LOCAL_SCHEMES.has(parsed.protocol)) {
+    return true;
+  }
+
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    return false;
+  }
+
+  if (parsed.username || parsed.password) {
+    return false;
+  }
+
+  const hostname = parsed.hostname.toLowerCase();
+  let verdict = cache.get(hostname);
+  if (!verdict) {
+    verdict = resolvePublicAddresses(hostname)
+      .then(() => true)
+      .catch(() => false);
+    cache.set(hostname, verdict);
+  }
+
+  return verdict;
+};
 
 export class Orchestrator {
   private browserPool?: BrowserPool;
@@ -142,7 +276,7 @@ export class Orchestrator {
       },
     };
 
-    if (options?.aiReclassify && options.aiSeedSignals) {
+      if (options?.aiReclassify && options.aiSeedSignals) {
       const seed = options.aiSeedSignals;
       context.htmlSignals = {
         title: seed.title?.trim() || domain,
@@ -159,7 +293,11 @@ export class Orchestrator {
 
       if (options.screenshotUrl) {
         try {
-          const res = await fetch(options.screenshotUrl, { signal: AbortSignal.timeout(10_000) });
+          const res = await fetchDirectWithSafeRedirects(options.screenshotUrl, {
+            timeoutMs: 10_000,
+            retryAttempts: 0,
+            retryBaseMs: 1,
+          });
           if (res.ok) {
             const buf = Buffer.from(await res.arrayBuffer());
             context.browser = { screenshotBuffer: buf };
@@ -193,45 +331,53 @@ export class Orchestrator {
         const laneBrowserStartedAt = Date.now();
         const browserAttemptStartedAt = Date.now();
         const browserTimeoutMs = this.resolveBrowserTimeout(options);
+        let pinnedResolverRules: string | null = null;
 
         // --- Reachability gate: DNS + HTTP pre-check ---
         let reachable = true;
         let useHttpUrl: string | null = null;
 
         try {
-          await dns.resolve4(domain);
-        } catch {
-          try {
-            await dns.resolve6(domain);
+          const addresses = await resolvePublicAddresses(domain);
+          pinnedResolverRules = buildPinnedHostResolverRules(domain, addresses);
+          if (addresses.some((address) => address.includes(':'))) {
             this.logger.info({ trace_id: traceId, domain, module: 'orchestrator', event: 'precheck_dns_ipv6_ok' });
-          } catch {
-            reachable = false;
-            context.metadata = { ...context.metadata, unreachable: true };
-            this.logger.info({ trace_id: traceId, domain, module: 'orchestrator', event: 'precheck_dns_failed' });
-            fetchTrace.push(buildFetchTraceEntry('browser', 'direct', browserAttemptStartedAt, new Error('DNS_NOT_RESOLVED')));
           }
+        } catch (error) {
+          reachable = false;
+          context.metadata = { ...context.metadata, unreachable: true };
+          this.logger.info({
+            trace_id: traceId,
+            domain,
+            module: 'orchestrator',
+            event: 'precheck_dns_failed',
+            error: error instanceof Error ? error.message : String(error),
+          });
+          fetchTrace.push(buildFetchTraceEntry('browser', 'direct', browserAttemptStartedAt, error));
         }
 
         if (reachable) {
           try {
-            const ctrl = new AbortController();
-            const timer = setTimeout(() => ctrl.abort(), 3000);
             try {
-              await fetch(`https://${domain}`, { method: 'HEAD', signal: ctrl.signal, redirect: 'follow' });
+              await fetchDirectWithSafeRedirects(`https://${domain}`, {
+                timeoutMs: 3000,
+                retryAttempts: 0,
+                retryBaseMs: 1,
+                requestInit: { method: 'HEAD' },
+              });
             } catch {
               // HTTPS failed, try HTTP
-              const ctrl2 = new AbortController();
-              const timer2 = setTimeout(() => ctrl2.abort(), 3000);
               try {
-                await fetch(`http://${domain}`, { method: 'HEAD', signal: ctrl2.signal, redirect: 'follow' });
+                await fetchDirectWithSafeRedirects(`http://${domain}`, {
+                  timeoutMs: 3000,
+                  retryAttempts: 0,
+                  retryBaseMs: 1,
+                  requestInit: { method: 'HEAD' },
+                });
                 useHttpUrl = `http://${domain}`;
               } catch {
                 this.logger.info({ trace_id: traceId, domain, module: 'orchestrator', event: 'precheck_http_failed_soft' });
-              } finally {
-                clearTimeout(timer2);
               }
-            } finally {
-              clearTimeout(timer);
             }
           } catch {
             // pre-check itself errored, proceed with browser anyway
@@ -246,9 +392,25 @@ export class Orchestrator {
           }
 
           try {
-            browserResources.browser = this.browserPool
-              ? await this.browserPool.acquire()
-              : await chromium.launch({ headless: true });
+            if (pinnedResolverRules) {
+              if (this.browserPool) {
+                this.logger.info({
+                  trace_id: traceId,
+                  domain,
+                  module: 'orchestrator',
+                  event: 'browser_pool_bypassed_for_dns_pin',
+                });
+              }
+
+              browserResources.browser = await chromium.launch({
+                headless: true,
+                args: [`--host-resolver-rules=${pinnedResolverRules}`],
+              });
+            } else {
+              browserResources.browser = this.browserPool
+                ? await this.browserPool.acquire()
+                : await chromium.launch({ headless: true });
+            }
             browserResources.context = await browserResources.browser.newContext({
               viewport: this.providerRuntime.browserViewport,
               userAgent: this.providerRuntime.userAgent,
@@ -259,8 +421,11 @@ export class Orchestrator {
             });
             browserResources.page = await browserResources.context.newPage();
 
+            const browserRequestSafetyCache: BrowserRequestSafetyCache = new Map();
+            const loggedBlockedBrowserHosts = new Set<string>();
+
             // Block heavy resources + tracking scripts to speed up navigation
-            await browserResources.page.route('**/*', (route) => {
+            await browserResources.page.route('**/*', async (route) => {
               const type = route.request().resourceType();
               if (type === 'font' || type === 'media') {
                 return route.abort();
@@ -269,6 +434,24 @@ export class Orchestrator {
               if (/google-analytics|googletagmanager|facebook\.net|connect\.facebook|hotjar|doubleclick|adsbygoogle|googlesyndication|tracking|pixel/.test(url)) {
                 return route.abort();
               }
+
+              const allowed = await shouldAllowBrowserRequestUrl(url, browserRequestSafetyCache);
+              if (!allowed) {
+                const blockedHost = getHostnameForLog(url);
+                if (!loggedBlockedBrowserHosts.has(blockedHost)) {
+                  loggedBlockedBrowserHosts.add(blockedHost);
+                  this.logger.warn({
+                    trace_id: traceId,
+                    domain,
+                    module: 'orchestrator',
+                    event: 'browser_request_blocked',
+                    host: blockedHost,
+                    resourceType: type,
+                  });
+                }
+                return route.abort();
+              }
+
               return route.continue();
             });
 
@@ -277,8 +460,13 @@ export class Orchestrator {
               timeout: browserTimeoutMs,
             });
 
-            // Wait briefly for late scripts, but don't fail on timeout
-            await browserResources.page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
+            // Keep the post-domcontentloaded idle wait short and configurable so
+            // slow third-party requests do not pin scarce browser slots.
+            if (this.providerRuntime.browserNetworkIdleTimeoutMs > 0) {
+              await browserResources.page.waitForLoadState('networkidle', {
+                timeout: this.providerRuntime.browserNetworkIdleTimeoutMs,
+              }).catch(() => {});
+            }
 
             // Capture screenshot + HTML in parallel, then release browser immediately
             const [screenshotBuffer, html] = await Promise.all([
@@ -304,10 +492,12 @@ export class Orchestrator {
             browserResources.context = null;
             browserResources.browser = null;
 
-            context.html = truncateHtml(html);
-            context.htmlSignals = parseHtmlSignals(context.html);
             context.url = finalUrl;
-            context.metadata = { ...context.metadata, htmlSource: 'browser' };
+            const blocked = !applySafeHtmlToContext(context, {
+              html,
+              source: 'browser',
+              status: response?.status(),
+            });
             context.browser = {
               finalUrl,
               screenshotBuffer: screenshotBuffer ?? undefined,
@@ -321,6 +511,7 @@ export class Orchestrator {
               ok: true,
               hasScreenshot: !!screenshotBuffer,
               htmlLength: html.length,
+              blocked,
               statusCode: response?.status(),
               latencyMs: Date.now() - browserAttemptStartedAt,
             });
@@ -362,7 +553,7 @@ export class Orchestrator {
       }
 
       // HTML fallback chain: only for browser phase (async/traffic/radar providers don't use HTML)
-      if (!context.html && needsBrowser) {
+      if (!context.html && needsBrowser && !context.metadata?.unreachable) {
         const fallback = await fetchHtmlWithFallbackChain(context.url, {
           timeoutMs: this.providerRuntime.timeoutMs,
           retryAttempts: this.providerRuntime.retryAttempts,
@@ -389,9 +580,19 @@ export class Orchestrator {
         });
 
         if (fallback?.html) {
-          context.html = truncateHtml(fallback.html);
-          context.htmlSignals = parseHtmlSignals(context.html);
-          context.metadata = { ...context.metadata, htmlSource: fallback.source };
+          const blocked = !applySafeHtmlToContext(context, {
+            html: fallback.html,
+            source: fallback.source,
+          });
+          if (blocked) {
+            this.logger.warn({
+              trace_id: traceId,
+              domain,
+              module: 'orchestrator',
+              event: 'bootstrap_html_blocked',
+              source: fallback.source,
+            });
+          }
           fetchTrace.push(...fallback.trace);
         } else {
           this.logger.warn({
@@ -401,6 +602,13 @@ export class Orchestrator {
             event: 'bootstrap_html_fetch_failed',
           });
         }
+      } else if (!context.html && needsBrowser && context.metadata?.unreachable) {
+        this.logger.warn({
+          trace_id: traceId,
+          domain,
+          module: 'orchestrator',
+          event: 'bootstrap_html_fetch_skipped_unreachable',
+        });
       }
 
       this.logger.info({ trace_id: traceId, domain, module: 'orchestrator', event: 'analysis_started', phase });
@@ -419,6 +627,10 @@ export class Orchestrator {
         selectedProviders = this.providers.filter((p) => WHOIS_PROVIDER_SET.has(p.name));
       } else if (phase === 'radar') {
         selectedProviders = this.providers.filter((p) => RADAR_PROVIDER_SET.has(p.name));
+      }
+
+      if (options?.skipAuthority) {
+        selectedProviders = selectedProviders.filter((p) => p.name !== 'authority.provider');
       }
 
       const nonAiProviders = selectedProviders.filter((p) => p.name !== 'ai.provider');
@@ -467,6 +679,7 @@ export class Orchestrator {
           source: context.metadata?.htmlSource ?? 'none',
           length: context.html?.length ?? 0,
           primary_h1: context.htmlSignals?.primaryH1,
+          blocked: Boolean(context.metadata?.blocked),
         },
         ai: {
           ...(report._meta?.ai ?? {}),
@@ -516,7 +729,7 @@ export class Orchestrator {
     }
 
     const settledResults = await Promise.allSettled(
-      providers.map((provider) => provider.run(context)),
+      providers.map((provider) => this.runProviderWithDeadline(provider, context)),
     );
 
     const results: ProviderResult[] = [];
@@ -559,6 +772,38 @@ export class Orchestrator {
     return results;
   }
 
+  private async runProviderWithDeadline(provider: Provider, context: CrawlContext): Promise<ProviderResult> {
+    const timeoutMs = resolveProviderDeadlineMs(provider.name, this.providerRuntime);
+    const startedAt = Date.now();
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const timeoutResult = new Promise<ProviderResult>((resolve) => {
+      timer = setTimeout(() => {
+        resolve({
+          provider: provider.name,
+          ok: false,
+          latencyMs: Date.now() - startedAt,
+          data: null,
+          error: {
+            code: 'PROVIDER_TIMEOUT',
+            message: `Provider exceeded ${timeoutMs}ms deadline`,
+          },
+        });
+      }, timeoutMs);
+    });
+
+    try {
+      return await Promise.race([
+        provider.run(context),
+        timeoutResult,
+      ]);
+    } finally {
+      if (timer) {
+        clearTimeout(timer);
+      }
+    }
+  }
+
   private resolveBrowserTimeout(options?: AnalyzeOptions): number {
     const defaultTimeoutMs = this.providerRuntime.browserTimeoutMs;
     const highValueTimeoutMs = this.providerRuntime.browserHighValueTimeoutMs;
@@ -584,6 +829,10 @@ export class Orchestrator {
     domain: string,
     options?: AnalyzeOptions,
   ): { shouldRun: boolean; reason: 'skip_ai' | 'force_ai' | 'auto' | 'disabled' | 'no_signal' | 'spam_guard' | 'ai_provider_missing' | 'no_rank' } {
+    if (context.metadata?.blocked) {
+      return { shouldRun: false, reason: 'no_signal' };
+    }
+
     if (options?.skipAi) {
       return { shouldRun: false, reason: 'skip_ai' };
     }
@@ -765,6 +1014,19 @@ export class Orchestrator {
           }
           break;
         }
+        case 'authority.provider': {
+          const authority = parseAuthorityData(result.data);
+          if (authority) {
+            report.authority = {
+              domainRating: authority.domainRating,
+              source: authority.source,
+              licenseUrl: authority.licenseUrl,
+              attribution: authority.attribution,
+              fetchedAt: authority.fetchedAt,
+            };
+          }
+          break;
+        }
         case 'traffic.provider': {
           const traffic = parseTrafficData(result.data);
           if (traffic) {
@@ -775,6 +1037,12 @@ export class Orchestrator {
               bounceRate: traffic.bounceRate,
               avgVisitDuration: traffic.avgVisitDuration,
               pagesPerVisit: traffic.pagesPerVisit,
+              dataYear: traffic.dataYear,
+              dataMonth: traffic.dataMonth,
+              isStale: traffic.isStale,
+              dataAgeDays: traffic.dataAgeDays,
+              snapshotDate: traffic.snapshotDate,
+              cachedAt: traffic.cachedAt,
               topCountry: traffic.topRegions[0]?.country,
               topRegions: traffic.topRegions,
               topKeywords: traffic.topKeywords,

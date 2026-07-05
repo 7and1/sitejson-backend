@@ -1,6 +1,6 @@
 import type { AlternativeSearchResult, AlternativeSiteItem } from '../core/types.js';
 
-export const ALTERNATIVES_CACHE_ALGORITHM_VERSION = 'rule_based:v1';
+export const ALTERNATIVES_CACHE_ALGORITHM_VERSION = 'semantic_embedding:v1';
 export const ALTERNATIVES_DURABLE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 export const ALTERNATIVES_CACHE_MIN_SEO_QUALITY_SCORE = 0.35;
 
@@ -61,7 +61,7 @@ export const parseAlternativesCachePayload = (
     .slice(0, safeLimit);
 
   return {
-    algorithm: 'rule_based',
+    algorithm: 'semantic_embedding',
     items,
   };
 };

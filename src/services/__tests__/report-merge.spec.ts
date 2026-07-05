@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { mergeSiteReports, sanitizeSiteReport } from '../report-merge.js';
+import { guardBlockedSiteReport, mergeSiteReports, sanitizeSiteReport } from '../report-merge.js';
 
 describe('mergeSiteReports', () => {
   it('keeps existing whois/domainAge when new traffic payload has nullish backfill fields', () => {
@@ -147,7 +147,7 @@ describe('mergeSiteReports', () => {
     ]);
   });
 
-  it('strips legacy score and seo.contacts fields', () => {
+  it('preserves score while stripping legacy seo.contacts fields', () => {
     const report = sanitizeSiteReport({
       domain: 'example.com',
       updatedAt: '2026-02-01T00:00:00.000Z',
@@ -159,10 +159,14 @@ describe('mergeSiteReports', () => {
       },
       score: {
         value: 10,
+        signals: ['legacy_score'],
       },
     } as any);
 
-    expect((report as unknown as Record<string, unknown>).score).toBeUndefined();
+    expect(report.score).toEqual({
+      value: 10,
+      signals: ['legacy_score'],
+    });
     expect(((report.seo ?? {}) as Record<string, unknown>).contacts).toBeUndefined();
     expect(report.seo?.h1Count).toBe(1);
   });
@@ -200,7 +204,7 @@ describe('mergeSiteReports', () => {
     ]);
   });
 
-  it('drops legacy fields from previous report during merge', () => {
+  it('keeps score from previous report while dropping legacy seo.contacts fields during merge', () => {
     const previous = {
       domain: 'example.com',
       updatedAt: '2026-02-01T00:00:00.000Z',
@@ -212,6 +216,7 @@ describe('mergeSiteReports', () => {
       },
       score: {
         value: 30,
+        signals: ['previous_score'],
       },
     };
 
@@ -224,9 +229,139 @@ describe('mergeSiteReports', () => {
     };
 
     const merged = mergeSiteReports(previous as any, next as any);
-    expect((merged as unknown as Record<string, unknown>).score).toBeUndefined();
+    expect(merged.score).toEqual({
+      value: 30,
+      signals: ['previous_score'],
+    });
     expect(((merged.seo ?? {}) as Record<string, unknown>).contacts).toBeUndefined();
     expect(merged.seo?.h1Count).toBe(1);
     expect(merged.seo?.h2Count).toBe(5);
+  });
+
+  it('guards blocked crawl artifacts for API output', () => {
+    const guarded = guardBlockedSiteReport({
+      domain: 'example.com',
+      updatedAt: '2026-02-02T00:00:00.000Z',
+      meta: {
+        title: 'Example title',
+        description: 'Example description',
+        techStackDetected: ['React'],
+      },
+      seo: {
+        h1Count: 1,
+      },
+      taxonomy: {
+        iabCategory: 'Technology & Computing',
+        tags: ['saas'],
+      },
+      aiAnalysis: {
+        risk: {
+          sentiment: 'Professional',
+          score: 8,
+          isSpam: false,
+        },
+      },
+      visual: {
+        screenshotUrl: 'https://cdn.example.com/example.webp',
+        dominantColor: '#112233',
+        palette: ['#112233', '#445566'],
+      },
+      providerHealth: [
+        { provider: 'meta.provider', ok: true },
+      ],
+      _meta: {
+        html: {
+          blocked: true,
+          source: 'browser',
+          length: 1200,
+          primary_h1: 'Example heading',
+        },
+      },
+    } as any);
+
+    expect(guarded.meta).toBeUndefined();
+    expect(guarded.seo).toBeUndefined();
+    expect(guarded.taxonomy).toBeUndefined();
+    expect(guarded.aiAnalysis).toBeUndefined();
+    expect(guarded.visual).toEqual({
+      screenshotUrl: 'https://cdn.example.com/example.webp',
+    });
+    expect(guarded._meta?.html).toMatchObject({
+      blocked: true,
+      length: 0,
+    });
+    expect(guarded.providerHealth).toEqual(expect.arrayContaining([
+      { provider: 'meta.provider', ok: false, errorCode: 'BOT_CHALLENGE_BLOCKED' },
+      { provider: 'seo.provider', ok: false, errorCode: 'BOT_CHALLENGE_BLOCKED' },
+      { provider: 'ai.provider', ok: false, errorCode: 'BOT_CHALLENGE_BLOCKED' },
+    ]));
+  });
+
+  it('does not carry previous page-content fields forward when the new crawl is blocked', () => {
+    const previous = {
+      domain: 'example.com',
+      updatedAt: '2026-02-01T00:00:00.000Z',
+      meta: {
+        title: 'Real title',
+        description: 'Real description',
+        techStackDetected: ['Next.js'],
+      },
+      seo: {
+        h1Count: 2,
+        internalLinks: 15,
+      },
+      taxonomy: {
+        iabCategory: 'Technology & Computing',
+        tags: ['saas'],
+      },
+      aiAnalysis: {
+        risk: {
+          sentiment: 'Professional',
+          score: 4,
+          isSpam: false,
+        },
+      },
+      visual: {
+        screenshotUrl: 'https://cdn.example.com/real.webp',
+        dominantColor: '#112233',
+        palette: ['#112233', '#445566'],
+      },
+      trafficData: {
+        monthlyVisits: 1000,
+      },
+    };
+
+    const next = {
+      domain: 'example.com',
+      updatedAt: '2026-02-02T00:00:00.000Z',
+      visual: {
+        screenshotUrl: 'https://cdn.example.com/blocked.webp',
+      },
+      providerHealth: [
+        { provider: 'meta.provider', ok: false, errorCode: 'BOT_CHALLENGE_BLOCKED' },
+      ],
+      _meta: {
+        html: {
+          blocked: true,
+          source: 'browser',
+          length: 0,
+        },
+      },
+    };
+
+    const merged = mergeSiteReports(previous as any, next as any);
+
+    expect(merged.meta).toBeUndefined();
+    expect(merged.seo).toBeUndefined();
+    expect(merged.taxonomy).toBeUndefined();
+    expect(merged.aiAnalysis).toBeUndefined();
+    expect(merged.visual).toEqual({
+      screenshotUrl: 'https://cdn.example.com/blocked.webp',
+    });
+    expect(merged.trafficData?.monthlyVisits).toBe(1000);
+    expect(merged._meta?.html).toMatchObject({
+      blocked: true,
+      length: 0,
+    });
   });
 });

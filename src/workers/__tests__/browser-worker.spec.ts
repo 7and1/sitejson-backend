@@ -1,5 +1,16 @@
 import { describe, expect, it, vi } from 'vitest';
 import { BrowserWorker } from '../browser-worker.js';
+import { computeContentHash } from '../../services/content-hash.js';
+
+const { notifyAnalyzeCompleted, notifyAnalyzeFailed } = vi.hoisted(() => ({
+  notifyAnalyzeCompleted: vi.fn(),
+  notifyAnalyzeFailed: vi.fn(),
+}));
+
+vi.mock('../../services/analyze-webhook.js', () => ({
+  notifyAnalyzeCompleted,
+  notifyAnalyzeFailed,
+}));
 
 const noopLogger = {
   info: vi.fn(),
@@ -264,12 +275,270 @@ describe('BrowserWorker async-fill enqueue', () => {
       expect.objectContaining({
         phase: 'async',
         purpose: 'async-fill',
+        parentJobId: 'job-browser',
         domain: 'example.com',
         traceId: 'trc-browser',
         forceRefresh: true,
         skipAi: true,
       }),
       'async',
+    );
+    expect(queue.enqueue.mock.calls[0][0]).not.toHaveProperty('crawlJobId');
+    expect(jobs.markCompleted).toHaveBeenCalledWith('crawl-1', 'browser_completed', 100);
+  });
+
+  it('skips async AI when content hash is unchanged and taxonomy is current', async () => {
+    const queue = {
+      enqueue: vi.fn(),
+      enqueueBulk: vi.fn(),
+      addRepeatable: vi.fn(),
+      consume: vi.fn(),
+      getCounts: vi.fn(),
+      getAllCounts: vi.fn(),
+      retryFailed: vi.fn(),
+      healthCheck: vi.fn(),
+    };
+
+    const report = {
+      domain: 'example.com',
+      updatedAt: new Date().toISOString(),
+      visual: { screenshotUrl: 'https://cdn.example.com/s.webp', storage: 'r2' as const },
+      meta: { title: 'Example', description: 'Example', techStackDetected: [] },
+      seo: { h1Count: 1, h2Count: 0, internalLinks: 1, externalLinks: 0, imagesCount: 0 },
+      _meta: { html: { primary_h1: 'Example', length: 123 } },
+    };
+    const contentHash = computeContentHash({
+      title: report.meta.title,
+      description: report.meta.description,
+      primaryH1: report._meta.html.primary_h1,
+      contentLength: report._meta.html.length,
+    });
+
+    const sites = {
+      getByDomain: vi.fn().mockResolvedValue(null),
+      upsert: vi.fn(),
+    };
+
+    const crawlTargets = {
+      getByDomain: vi.fn().mockResolvedValue({
+        isHighValue: false,
+        radarRank: 50_000,
+        taxonomyData: {
+          iabCategory: 'Technology & Computing',
+          iabSubCategory: 'Software',
+          confidence: 0.92,
+          tags: ['saas'],
+        },
+        taxonomyPromptVersion: 2,
+        lastContentHash: contentHash,
+      }),
+      markLayerResult: vi.fn(),
+      update: vi.fn(),
+    };
+
+    const jobs = {
+      markRunning: vi.fn(),
+      markCompleted: vi.fn(),
+      markFailed: vi.fn(),
+    };
+
+    const orchestrator = {
+      analyze: vi.fn().mockResolvedValue(report),
+    };
+
+    const worker = new BrowserWorker(
+      queue as any,
+      sites as any,
+      crawlTargets as any,
+      jobs as any,
+      orchestrator as any,
+      noopLogger as any,
+      2,
+    );
+
+    await worker.process({
+      jobId: 'job-browser',
+      domain: 'example.com',
+      traceId: 'trc-browser',
+      phase: 'browser',
+      purpose: 'browser',
+    });
+
+    expect(queue.enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        phase: 'async',
+        skipAi: true,
+        contentHash,
+      }),
+      'async',
+    );
+  });
+
+  it('clears the previous content hash when the browser crawl is blocked', async () => {
+    const queue = {
+      enqueue: vi.fn(),
+      enqueueBulk: vi.fn(),
+      addRepeatable: vi.fn(),
+      consume: vi.fn(),
+      getCounts: vi.fn(),
+      getAllCounts: vi.fn(),
+      retryFailed: vi.fn(),
+      healthCheck: vi.fn(),
+    };
+
+    const sites = {
+      getByDomain: vi.fn().mockResolvedValue(null),
+      upsert: vi.fn(),
+    };
+
+    const crawlTargets = {
+      getByDomain: vi.fn().mockResolvedValue({
+        isHighValue: false,
+        radarRank: 50_000,
+        taxonomyData: {
+          iabCategory: 'Technology & Computing',
+          iabSubCategory: 'Software',
+          confidence: 0.92,
+          tags: ['saas'],
+        },
+        taxonomyPromptVersion: 2,
+        lastContentHash: 'poisoned-hash',
+      }),
+      markLayerResult: vi.fn(),
+      update: vi.fn(),
+    };
+
+    const jobs = {
+      markRunning: vi.fn(),
+      markCompleted: vi.fn(),
+      markFailed: vi.fn(),
+    };
+
+    const orchestrator = {
+      analyze: vi.fn().mockResolvedValue({
+        domain: 'blocked.example',
+        updatedAt: new Date().toISOString(),
+        visual: { screenshotUrl: 'https://cdn.example.com/s.webp', storage: 'r2' },
+        providerHealth: [
+          { provider: 'meta.provider', ok: false, errorCode: 'BOT_CHALLENGE_BLOCKED' },
+        ],
+        _meta: {
+          html: {
+            blocked: true,
+            source: 'browser',
+            length: 0,
+          },
+        },
+      }),
+    };
+
+    const worker = new BrowserWorker(
+      queue as any,
+      sites as any,
+      crawlTargets as any,
+      jobs as any,
+      orchestrator as any,
+      noopLogger as any,
+      2,
+    );
+
+    await worker.process({
+      jobId: 'job-browser-blocked',
+      domain: 'blocked.example',
+      traceId: 'trc-browser-blocked',
+      phase: 'browser',
+      purpose: 'browser',
+    });
+
+    expect(crawlTargets.update).toHaveBeenCalledWith(
+      'blocked.example',
+      expect.objectContaining({
+        lastContentHash: null,
+      }),
+    );
+    expect(queue.enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        phase: 'async',
+        contentHash: undefined,
+      }),
+      'async',
+    );
+  });
+
+  it('sends a completion webhook when the crawl job finishes', async () => {
+    vi.clearAllMocks();
+    const queue = {
+      enqueue: vi.fn(),
+      enqueueBulk: vi.fn(),
+      addRepeatable: vi.fn(),
+      consume: vi.fn(),
+      getCounts: vi.fn(),
+      getAllCounts: vi.fn(),
+      retryFailed: vi.fn(),
+      healthCheck: vi.fn(),
+    };
+
+    const sites = {
+      getByDomain: vi.fn().mockResolvedValue(null),
+      upsert: vi.fn(),
+    };
+
+    const crawlTargets = {
+      getByDomain: vi.fn().mockResolvedValue({
+        isHighValue: false,
+        radarRank: 50_000,
+        taxonomyData: undefined,
+        taxonomyPromptVersion: 1,
+      }),
+      markLayerResult: vi.fn(),
+      update: vi.fn(),
+    };
+
+    const jobs = {
+      markRunning: vi.fn(),
+      markCompleted: vi.fn(),
+      markFailed: vi.fn(),
+    };
+
+    const orchestrator = {
+      analyze: vi.fn().mockResolvedValue({
+        domain: 'example.com',
+        updatedAt: new Date().toISOString(),
+        meta: { title: 'Example', description: 'Example', techStackDetected: [] },
+        seo: { h1Count: 1, h2Count: 0, internalLinks: 1, externalLinks: 0, imagesCount: 0 },
+        _meta: { html: { primary_h1: 'Example', length: 123 } },
+      }),
+    };
+
+    const worker = new BrowserWorker(
+      queue as any,
+      sites as any,
+      crawlTargets as any,
+      jobs as any,
+      orchestrator as any,
+      noopLogger as any,
+      2,
+    );
+
+    await worker.process({
+      jobId: 'job-browser',
+      crawlJobId: 'crawl-1',
+      domain: 'example.com',
+      traceId: 'trc-browser',
+      phase: 'browser',
+      purpose: 'browser',
+      webhookUrl: 'https://hooks.example.com/sitejson',
+      priority: 'normal',
+    });
+
+    expect(notifyAnalyzeCompleted).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({
+        webhookUrl: 'https://hooks.example.com/sitejson',
+        jobId: 'crawl-1',
+        domain: 'example.com',
+        stage: 'browser_completed',
+      }),
     );
   });
 });

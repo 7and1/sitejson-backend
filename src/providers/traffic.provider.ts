@@ -1,4 +1,5 @@
 import type { CrawlContext } from '../core/types.js';
+import { resolvePublicAddresses } from '../services/network-safety.js';
 import { providerFailure, providerSuccess } from './base.js';
 import type { Provider } from './base.js';
 import {
@@ -354,10 +355,14 @@ interface SimilarwebPayload {
   monthly_visits?: number;
   global_rank?: number;
   country_rank?: number;
+  category_rank?: number;
   bounce_rate?: number;
   pages_per_visit?: number;
   avg_visit_duration?: number;
   snapshot_date?: string;
+  stale?: boolean;
+  data_age_days?: number | string;
+  last_updated?: string;
   traffic_sources?: SimilarwebTrafficSources;
   top_keywords?: SimilarwebKeyword[];
   top_country_shares?: SimilarwebRegion[];
@@ -424,6 +429,9 @@ const transformTrafficData = (raw: TrafficRawData): TrafficData => {
     pagesPerVisit: overview?.pagePerVisit ? parseFloat(overview.pagePerVisit) : null,
     dataYear: overview?.year ?? null,
     dataMonth: overview?.month ?? null,
+    isStale: null,
+    dataAgeDays: null,
+    snapshotDate: null,
     trafficSources: sources ? {
       direct: sources.direct ?? 0,
       search: sources.search ?? 0,
@@ -605,6 +613,19 @@ const parseSnapshotYearMonth = (snapshotDate?: string): { year: string | null; m
   return { year: match[1], month: match[2] };
 };
 
+const parseIsoToUnixSeconds = (value?: string): number | null => {
+  if (!value || value.trim().length === 0) {
+    return null;
+  }
+
+  const timestampMs = Date.parse(value);
+  if (!Number.isFinite(timestampMs)) {
+    return null;
+  }
+
+  return Math.trunc(timestampMs / 1000);
+};
+
 const transformSimilarwebData = (input: SimilarwebPayload): TrafficData => {
   const snapshot = parseSnapshotYearMonth(input.snapshot_date);
   const engagementYear = toFiniteNumber(input.Engagments?.Year);
@@ -628,10 +649,13 @@ const transformSimilarwebData = (input: SimilarwebPayload): TrafficData => {
     pagesPerVisit: toFiniteNumber(input.pages_per_visit ?? input.Engagments?.PagePerVisit),
     dataYear: resolvedYear,
     dataMonth: resolvedMonth,
+    isStale: typeof input.stale === 'boolean' ? input.stale : null,
+    dataAgeDays: toFiniteNumber(input.data_age_days),
+    snapshotDate: input.snapshot_date?.trim() || null,
     trafficSources,
     topKeywords: normalizeSimilarwebKeywords(input),
     topRegions: normalizeSimilarwebRegions(input),
-    cachedAt: null,
+    cachedAt: parseIsoToUnixSeconds(input.last_updated),
   };
 };
 
@@ -831,6 +855,17 @@ export class TrafficProvider implements Provider<TrafficData & { source?: Traffi
     const url = `https://traffic.cv/${encodeURIComponent(ctx.domain)}?_rsc=1`;
     const timeoutMs = Math.min(this.options.timeoutMs ?? 15000, 5000);
     const retryBaseMs = this.options.retryBaseMs ?? 500;
+
+    try {
+      await resolvePublicAddresses(ctx.domain);
+    } catch (error) {
+      return providerFailure(
+        this.name,
+        startedAt,
+        'TRAFFIC_UNREACHABLE',
+        error instanceof Error ? error.message : 'Domain is not publicly reachable',
+      );
+    }
 
     const maxPrimaryProxies = Math.max(1, Math.trunc(this.rotation.maxPrimaryProxies ?? 4));
 

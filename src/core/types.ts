@@ -48,6 +48,7 @@ export interface CrawlContext {
     taxonomyCacheHit?: boolean;
     htmlSource?: 'browser' | 'direct' | 'proxy_grid' | 'soax' | 'none';
     unreachable?: boolean;
+    blocked?: boolean;
   };
   browser?: BrowserContext;
   options?: {
@@ -77,6 +78,10 @@ export interface SiteReport {
   domain: string;
   updatedAt: string;
   freshnessTtlSec?: number;
+  score?: {
+    value: number;
+    signals: string[];
+  };
   visual?: {
     screenshotUrl?: string;
     screenshotPath?: string;
@@ -103,6 +108,9 @@ export interface SiteReport {
   };
   dns?: {
     provider?: string;
+    aRecords?: string[];
+    aaaaRecords?: string[];
+    caaRecords?: string[];
     mxRecords?: string[];
     nsRecords?: string[];
     txtRecords?: string[];
@@ -121,6 +129,13 @@ export interface SiteReport {
     resellerCount?: number;
     monetizationSignals?: string[];
   };
+  authority?: {
+    domainRating?: number | null;
+    source?: 'ahrefs';
+    licenseUrl?: string;
+    attribution?: 'Domain Rating by Ahrefs';
+    fetchedAt?: string;
+  };
   trafficData?: {
     monthlyVisits?: number;
     globalRank?: number | null;
@@ -128,8 +143,15 @@ export interface SiteReport {
     bounceRate?: number | null;
     avgVisitDuration?: number | null;
     pagesPerVisit?: number | null;
+    dataYear?: string | null;
+    dataMonth?: string | null;
+    isStale?: boolean | null;
+    dataAgeDays?: number | null;
+    snapshotDate?: string | null;
+    cachedAt?: number | null;
     topCountry?: string;
     topRegions?: Array<{
+      countryCode?: number;
       country: string;
       share: number;
     }>;
@@ -203,6 +225,7 @@ export interface SiteReport {
       source?: 'browser' | 'direct' | 'proxy_grid' | 'soax' | 'none';
       length?: number;
       primary_h1?: string;
+      blocked?: boolean;
     };
     ai?: {
       evaluated?: boolean;

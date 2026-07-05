@@ -1,4 +1,5 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import {
   analyzeRequestSchema,
   alternativesQuerySchema,
@@ -6,19 +7,63 @@ import {
   ingestDomainsSchema,
   opsDashboardQuerySchema,
   retryDlqSchema,
+  trafficHistoryQuerySchema,
 } from './schemas.js';
 import type { AnalyzeService } from '../services/analyze-service.js';
 import type { IngestService } from '../services/ingest-service.js';
-import type { JobRepository, SiteRepository } from '../storage/interfaces.js';
+import type { CrawlTargetRepository, JobRepository, SiteRepository } from '../storage/interfaces.js';
 import type { JobQueue } from '../queue/interfaces.js';
 import { normalizeDomain } from '../services/domain.js';
 import type { OpsDashboardService } from '../services/ops-dashboard-service.js';
+import { buildQueueFailureAlerts } from '../services/ops-dashboard-service.js';
 import type { DirectorySearchOptions, SiteReport } from '../core/types.js';
-import { sanitizeSiteReport } from '../services/report-merge.js';
+import type { TrafficHistoryService } from '../services/traffic-history-service.js';
+import { guardBlockedSiteReport, sanitizeSiteReport } from '../services/report-merge.js';
+import { isQueueCapacityError } from '../queue/errors.js';
+import { buildSiteReportResponse } from '../services/site-report-response.js';
+
+type AuthRole = 'public' | 'pro' | 'ops';
+type RateLimitTier = AuthRole | 'anonymous';
+
+type AuthContext = {
+  role: AuthRole;
+  keyHash: string;
+};
+
+type AuthedRequest = FastifyRequest & {
+  sitejsonAuth?: AuthContext;
+};
+
+type RateLimitBucket = {
+  resetAt: number;
+  remaining: number;
+};
+
+type RateLimitPolicy = {
+  public: number;
+  pro?: number;
+  ops: number;
+  anonymous?: number;
+};
+
+type RateLimitResult =
+  | {
+    allowed: true;
+    limit: number;
+    remaining: number;
+    resetAt: number;
+  }
+  | {
+    allowed: false;
+    limit: number;
+    remaining: 0;
+    resetAt: number;
+    retryAfterSec: number;
+  };
 
 const VALID_PROVIDERS = [
   'visual', 'meta', 'seo', 'dns', 'ads', 'publisher',
-  'files', 'traffic', 'whois', 'radar', 'ai',
+  'files', 'authority', 'traffic', 'whois', 'radar', 'ai',
 ] as const;
 
 type ProviderName = (typeof VALID_PROVIDERS)[number];
@@ -31,7 +76,8 @@ const PROVIDER_EXPECTED_FIELDS: Record<ProviderName, string[]> = {
   ads: ['isAdvertiser', 'advertiserIds', 'advertiserNames', 'resultCount', 'transparencySignals'],
   publisher: ['hasAdsTxt', 'adSystems', 'directCount', 'resellerCount', 'monetizationSignals'],
   files: ['hasRobots', 'hasSitemap', 'robotsSitemapUrls'],
-  traffic: ['monthlyVisits', 'globalRank', 'countryRank', 'bounceRate', 'avgVisitDuration', 'pagesPerVisit', 'topCountry', 'topRegions', 'topKeywords', 'trafficSources'],
+  authority: ['domainRating', 'source', 'licenseUrl', 'attribution', 'fetchedAt'],
+  traffic: ['monthlyVisits', 'globalRank', 'countryRank', 'bounceRate', 'avgVisitDuration', 'pagesPerVisit', 'dataYear', 'dataMonth', 'isStale', 'dataAgeDays', 'snapshotDate', 'cachedAt', 'topCountry', 'topRegions', 'topKeywords', 'trafficSources'],
   whois: ['whois.registrar', 'whois.createdAt', 'whois.expiresAt', 'whois.nameservers', 'whois.status', 'domainAgeYears'],
   radar: ['globalRank', 'rankBucket', 'categories', 'sourceTimestamp'],
   ai: ['taxonomy.iabCategory', 'taxonomy.iabSubCategory', 'taxonomy.confidence', 'taxonomy.tags', 'aiAnalysis.business', 'aiAnalysis.risk', 'aiAnalysis.visualAnalysis'],
@@ -46,6 +92,7 @@ function extractProviderData(report: SiteReport, provider: ProviderName): Record
     case 'ads': return report.ads ? { ...report.ads } : null;
     case 'publisher': return report.publisher ? { ...report.publisher } : null;
     case 'files': return report.files ? { ...report.files } : null;
+    case 'authority': return report.authority ? { ...report.authority } : null;
     case 'traffic': {
       if (!report.trafficData) return null;
       const { whois: _w, domainAgeYears: _d, ...traffic } = report.trafficData;
@@ -77,13 +124,21 @@ function resolveNestedField(obj: Record<string, unknown>, path: string): unknown
   return cur;
 }
 
+function hasMeaningfulProviderValue(value: unknown): boolean {
+  if (value === undefined || value === null) return false;
+  if (typeof value === 'string') return value.trim().length > 0;
+  if (Array.isArray(value)) return value.some(hasMeaningfulProviderValue);
+  if (typeof value === 'object') return Object.values(value as Record<string, unknown>).some(hasMeaningfulProviderValue);
+  return true;
+}
+
 function getFieldCompleteness(data: Record<string, unknown> | null, expectedFields: string[]) {
   if (!data) return { total: expectedFields.length, present: 0, missing: expectedFields.length, fields: Object.fromEntries(expectedFields.map(f => [f, false])) };
   const fields: Record<string, boolean> = {};
   let present = 0;
   for (const f of expectedFields) {
     const val = resolveNestedField(data, f);
-    const has = val !== undefined && val !== null;
+    const has = hasMeaningfulProviderValue(val);
     fields[f] = has;
     if (has) present++;
   }
@@ -96,19 +151,181 @@ const respondError = (traceId: string, code: string, message: string) => ({
   meta: { trace_id: traceId },
 });
 
-const PUBLIC_PATHS = new Set([
+const keyHash = (value: string): string => (
+  createHash('sha256').update(value).digest('hex')
+);
+
+const secureStringEquals = (left: string, right: string): boolean => {
+  const leftBuffer = Buffer.from(keyHash(left), 'hex');
+  const rightBuffer = Buffer.from(keyHash(right), 'hex');
+  return timingSafeEqual(leftBuffer, rightBuffer);
+};
+
+const findMatchingKey = (providedKey: string, keys: string[]): string | null => {
+  for (const key of keys) {
+    if (secureStringEquals(providedKey, key)) {
+      return key;
+    }
+  }
+  return null;
+};
+
+const requestAuth = (request: FastifyRequest): AuthContext | undefined => (
+  (request as AuthedRequest).sitejsonAuth
+);
+
+const isOpsRequest = (request: FastifyRequest): boolean => requestAuth(request)?.role === 'ops';
+
+// Privileged analyze options (priority:'high', force_refresh, force_ai) are
+// allowed for both the ops tier and the dedicated pro tier; only /ops/* control
+// endpoints remain ops-only (enforced in the auth hook).
+const isPrivilegedAnalyzeAllowed = (request: FastifyRequest): boolean => {
+  const role = requestAuth(request)?.role;
+  return role === 'ops' || role === 'pro';
+};
+
+const hasPrivilegedAnalyzeOptions = (input: {
+  force_refresh?: boolean;
+  force_ai?: boolean;
+  priority?: 'normal' | 'high';
+}): boolean => (
+  input.force_refresh === true
+  || input.force_ai === true
+  || input.priority === 'high'
+);
+
+const resolveRateLimitTier = (request: FastifyRequest): RateLimitTier => (
+  requestAuth(request)?.role ?? 'anonymous'
+);
+
+const resolveRateLimitLimit = (request: FastifyRequest, policy: RateLimitPolicy): number => {
+  const tier = resolveRateLimitTier(request);
+  if (tier === 'ops') {
+    return policy.ops;
+  }
+  if (tier === 'pro') {
+    return policy.pro ?? policy.public;
+  }
+  if (tier === 'public') {
+    return policy.public;
+  }
+  return policy.anonymous ?? policy.public;
+};
+
+const resolveRateLimitBucketKey = (request: FastifyRequest, prefix: string): string => {
+  const auth = requestAuth(request);
+  const identity = auth?.keyHash ?? request.ip ?? 'unknown';
+  return `${prefix}:${resolveRateLimitTier(request)}:${identity}`;
+};
+
+const TRUSTED_CLIENT_FINGERPRINT_PATTERN = /^[a-f0-9]{16}$/u;
+
+const resolveTrustedAnalyzeClient = (request: FastifyRequest): string | null => {
+  if (!requestAuth(request)) {
+    return null;
+  }
+
+  const header = request.headers['x-sitejson-client'];
+  if (typeof header !== 'string' || !TRUSTED_CLIENT_FINGERPRINT_PATTERN.test(header)) {
+    return null;
+  }
+
+  return header;
+};
+
+const resolveAnalyzeClientBucketKey = (request: FastifyRequest, clientFingerprint: string): string => {
+  const auth = requestAuth(request);
+  const identity = auth?.keyHash ?? 'unknown';
+  return `analyze-client:${resolveRateLimitTier(request)}:${identity}:${clientFingerprint}`;
+};
+
+const setRateLimitHeaders = (
+  reply: FastifyReply,
+  rateLimit: RateLimitResult,
+  tier: RateLimitTier,
+): void => {
+  reply.header('X-RateLimit-Limit', String(rateLimit.limit));
+  reply.header('X-RateLimit-Remaining', String(rateLimit.remaining));
+  reply.header('X-RateLimit-Reset', String(Math.ceil(rateLimit.resetAt / 1000)));
+  reply.header('X-SiteJSON-RateLimit-Tier', tier);
+  if (!rateLimit.allowed) {
+    reply.header('Retry-After', String(rateLimit.retryAfterSec));
+  }
+};
+
+const createRateLimiter = () => {
+  const buckets = new Map<string, RateLimitBucket>();
+  let lastCleanupAt = 0;
+
+  return (bucketKey: string, limit: number, now = Date.now()): RateLimitResult => {
+    const safeLimit = Math.max(1, Math.trunc(limit));
+
+    if (now - lastCleanupAt >= 120_000) {
+      for (const [key, bucket] of buckets) {
+        if (bucket.resetAt <= now) {
+          buckets.delete(key);
+        }
+      }
+      lastCleanupAt = now;
+    }
+
+    const existing = buckets.get(bucketKey);
+
+    if (!existing || existing.resetAt <= now) {
+      buckets.set(bucketKey, {
+        resetAt: now + 60_000,
+        remaining: safeLimit - 1,
+      });
+      return {
+        allowed: true,
+        limit: safeLimit,
+        remaining: safeLimit - 1,
+        resetAt: now + 60_000,
+      };
+    }
+
+    if (existing.remaining <= 0) {
+      return {
+        allowed: false,
+        limit: safeLimit,
+        remaining: 0,
+        resetAt: existing.resetAt,
+        retryAfterSec: Math.max(1, Math.ceil((existing.resetAt - now) / 1000)),
+      };
+    }
+
+    existing.remaining -= 1;
+    return {
+      allowed: true,
+      limit: safeLimit,
+      remaining: existing.remaining,
+      resetAt: existing.resetAt,
+    };
+  };
+};
+
+const BASE_PUBLIC_PATHS = new Set([
   '/api/v1/healthz',
   '/api/v1/readyz',
   '/api/v1/insights',
+]);
+
+const DOCS_PUBLIC_PATHS = new Set([
   '/api/docs',
   '/api/docs/',
   '/api/openapi.json',
 ]);
 
-const createAuthHook = (apiKeys: string[]) => {
+const createAuthHook = (apiKeys: string[], opsApiKeys: string[], proApiKeys: string[], options?: { exposeApiDocs?: boolean }) => {
   return async (request: FastifyRequest, reply: FastifyReply) => {
     const requestPath = request.url.split('?', 1)[0] ?? request.url;
-    if (request.method === 'OPTIONS' || PUBLIC_PATHS.has(requestPath) || requestPath.startsWith('/api/docs')) {
+    const isPublicDocsPath = DOCS_PUBLIC_PATHS.has(requestPath) || requestPath.startsWith('/api/docs');
+    if (
+      request.method === 'OPTIONS'
+      || BASE_PUBLIC_PATHS.has(requestPath)
+      || requestPath.startsWith('/snapshots/')
+      || (options?.exposeApiDocs === true && isPublicDocsPath)
+    ) {
       return;
     }
 
@@ -117,9 +334,47 @@ const createAuthHook = (apiKeys: string[]) => {
       ? authHeader.slice(7)
       : (request.headers['x-api-key'] as string | undefined);
 
-    if (!providedKey || !apiKeys.includes(providedKey)) {
+    if (!providedKey) {
       return reply.status(401).send(respondError(request.id, 'UNAUTHORIZED', 'Invalid or missing API key'));
     }
+
+    const matchedOpsKey = findMatchingKey(providedKey, opsApiKeys);
+    if (matchedOpsKey) {
+      (request as AuthedRequest).sitejsonAuth = {
+        role: 'ops',
+        keyHash: keyHash(matchedOpsKey),
+      };
+      return;
+    }
+
+    const matchedProKey = findMatchingKey(providedKey, proApiKeys);
+    if (matchedProKey) {
+      // Pro tier: may use privileged analyze options, but is denied /ops/* control.
+      if (requestPath.startsWith('/api/v1/ops/')) {
+        return reply.status(403).send(respondError(request.id, 'FORBIDDEN', 'Ops API key required'));
+      }
+
+      (request as AuthedRequest).sitejsonAuth = {
+        role: 'pro',
+        keyHash: keyHash(matchedProKey),
+      };
+      return;
+    }
+
+    const matchedApiKey = findMatchingKey(providedKey, apiKeys);
+    if (matchedApiKey) {
+      if (requestPath.startsWith('/api/v1/ops/')) {
+        return reply.status(403).send(respondError(request.id, 'FORBIDDEN', 'Ops API key required'));
+      }
+
+      (request as AuthedRequest).sitejsonAuth = {
+        role: 'public',
+        keyHash: keyHash(matchedApiKey),
+      };
+      return;
+    }
+
+    return reply.status(401).send(respondError(request.id, 'UNAUTHORIZED', 'Invalid or missing API key'));
   };
 };
 
@@ -128,18 +383,41 @@ export const registerRoutes = (
   deps: {
     analyzeService: AnalyzeService;
     ingestService: IngestService;
+    trafficHistoryService?: TrafficHistoryService | null;
     opsDashboardService: OpsDashboardService;
     jobs: JobRepository;
     sites: SiteRepository;
+    crawlTargets?: CrawlTargetRepository;
     queue: JobQueue;
   },
   options?: {
     apiKeys?: string[];
+    opsApiKeys?: string[];
+    proApiKeys?: string[];
+    exposeApiDocs?: boolean;
+    analyzeRateLimits?: RateLimitPolicy;
+    analyzeClientRateLimits?: RateLimitPolicy;
+    ingestRateLimits?: RateLimitPolicy;
+    insightsRateLimitPerMinute?: number;
+    ingestMaxDomains?: number;
   },
 ) => {
   if (options?.apiKeys?.length) {
-    app.addHook('preHandler', createAuthHook(options.apiKeys));
+    app.addHook('preHandler', createAuthHook(
+      options.apiKeys,
+      options.opsApiKeys ?? [],
+      options.proApiKeys ?? [],
+      { exposeApiDocs: options.exposeApiDocs },
+    ));
   }
+
+  // Rate limiters are scoped per registerRoutes instance so that separate
+  // Fastify apps (e.g. each test case) get isolated buckets. Production builds
+  // one app per process, so this preserves the prior single-limiter behavior.
+  const analyzeRateLimiter = createRateLimiter();
+  const analyzeClientRateLimiter = createRateLimiter();
+  const ingestRateLimiter = createRateLimiter();
+  const insightsRateLimiter = createRateLimiter();
 
   app.post('/api/v1/sites/analyze', async (request, reply) => {
     const traceId = request.id;
@@ -148,18 +426,63 @@ export const registerRoutes = (
       return reply.status(400).send(respondError(traceId, 'INVALID_REQUEST', 'Body validation failed'));
     }
 
+    if (hasPrivilegedAnalyzeOptions(parsed.data) && !isPrivilegedAnalyzeAllowed(request)) {
+      return reply.status(403).send(respondError(traceId, 'FORBIDDEN', 'Ops or pro API key required for privileged analyze options'));
+    }
+
+    const tier = resolveRateLimitTier(request);
+    const limit = resolveRateLimitLimit(request, options?.analyzeRateLimits ?? { public: 60, pro: 120, ops: 300 });
+    const trustedClient = resolveTrustedAnalyzeClient(request);
+    if (trustedClient) {
+      const aggregateRateLimit = limit > 0
+        ? analyzeRateLimiter(resolveRateLimitBucketKey(request, 'analyze'), limit)
+        : null;
+      const clientLimit = resolveRateLimitLimit(request, options?.analyzeClientRateLimits ?? { public: 20, pro: 120, ops: 300 });
+      const clientRateLimit = clientLimit > 0
+        ? analyzeClientRateLimiter(resolveAnalyzeClientBucketKey(request, trustedClient), clientLimit)
+        : null;
+
+      if (clientRateLimit) {
+        setRateLimitHeaders(reply, clientRateLimit, tier);
+      } else if (aggregateRateLimit) {
+        setRateLimitHeaders(reply, aggregateRateLimit, tier);
+      }
+
+      if (aggregateRateLimit && !aggregateRateLimit.allowed) {
+        reply.header('Retry-After', String(aggregateRateLimit.retryAfterSec));
+        return reply.status(429).send(respondError(traceId, 'RATE_LIMITED', 'Analyze rate limit exceeded'));
+      }
+      if (clientRateLimit && !clientRateLimit.allowed) {
+        return reply.status(429).send(respondError(traceId, 'RATE_LIMITED', 'Analyze rate limit exceeded'));
+      }
+    } else if (limit > 0) {
+      const bucketKey = resolveRateLimitBucketKey(request, 'analyze');
+      const rateLimit = analyzeRateLimiter(bucketKey, limit);
+      setRateLimitHeaders(reply, rateLimit, tier);
+      if (!rateLimit.allowed) {
+        return reply.status(429).send(respondError(traceId, 'RATE_LIMITED', 'Analyze rate limit exceeded'));
+      }
+    }
+
     try {
+      const domain = normalizeDomain(parsed.data.domain);
       const result = await deps.analyzeService.schedule(
-        parsed.data.domain,
+        domain,
         parsed.data.force_refresh ?? false,
         parsed.data.force_ai ?? false,
         parsed.data.priority ?? 'normal',
         parsed.data.skip_ai ?? false,
+        parsed.data.webhook_url,
       );
-
-      if (!result.accepted && result.reason === 'JOB_ALREADY_RUNNING') {
-        return reply.status(409).send(respondError(traceId, 'JOB_ALREADY_RUNNING', 'Job already in progress'));
-      }
+      const [completedReport, completedTarget] = result.reason === 'ALREADY_FRESH' && result.jobId === null
+        ? await Promise.all([
+            deps.sites.getByDomain(domain),
+            deps.crawlTargets?.getByDomain(domain) ?? Promise.resolve(null),
+          ])
+        : [null, null];
+      const completedPayload = completedReport
+        ? await buildSiteReportResponse({ crawlTarget: completedTarget }, completedReport)
+        : null;
 
       return reply.status(202).send({
         ok: true,
@@ -168,6 +491,11 @@ export const registerRoutes = (
           status: result.jobId ? 'pending' : 'completed',
           priority: parsed.data.priority ?? 'normal',
           reason: result.reason,
+          ...(completedPayload ? {
+            freshness: completedPayload.data.freshness,
+            enrichment: completedPayload.data.enrichment,
+            report: completedPayload.data.report,
+          } : {}),
         },
         meta: {
           trace_id: traceId,
@@ -176,6 +504,10 @@ export const registerRoutes = (
     } catch (error) {
       if (error instanceof Error && error.message === 'INVALID_DOMAIN') {
         return reply.status(400).send(respondError(traceId, 'INVALID_DOMAIN', 'Domain is not valid'));
+      }
+
+      if (isQueueCapacityError(error)) {
+        return reply.status(503).send(respondError(traceId, 'QUEUE_OVERLOADED', 'Queue capacity is temporarily exhausted. Retry soon.'));
       }
 
       return reply.status(500).send(respondError(traceId, 'INTERNAL_ERROR', 'Unexpected server error'));
@@ -189,28 +521,55 @@ export const registerRoutes = (
       return reply.status(400).send(respondError(traceId, 'INVALID_REQUEST', 'Body validation failed'));
     }
 
-    const result = await deps.ingestService.enqueueBatch({
-      domains: parsed.data.domains,
-      traceId,
-      source: 'api',
-      priority: parsed.data.priority ?? 'normal',
-      forceRefresh: parsed.data.force_refresh,
-      forceAi: parsed.data.force_ai,
-      skipAi: parsed.data.skip_ai,
-    });
+    const maxDomains = Math.max(1, Math.trunc(options?.ingestMaxDomains ?? 100));
+    if (parsed.data.domains.length > maxDomains) {
+      return reply.status(400).send(respondError(traceId, 'INVALID_REQUEST', `Too many domains; maximum is ${maxDomains}`));
+    }
 
-    return reply.status(202).send({
-      ok: true,
-      data: {
-        accepted_count: result.accepted.length,
-        skipped_count: result.skipped.length,
-        invalid_count: result.invalid.length,
-        invalid_domains: result.invalid,
-      },
-      meta: {
-        trace_id: traceId,
-      },
-    });
+    if (hasPrivilegedAnalyzeOptions(parsed.data) && !isPrivilegedAnalyzeAllowed(request)) {
+      return reply.status(403).send(respondError(traceId, 'FORBIDDEN', 'Ops or pro API key required for privileged ingest options'));
+    }
+
+    const ingestLimit = resolveRateLimitLimit(request, options?.ingestRateLimits ?? { public: 60, pro: 120, ops: 120 });
+    if (ingestLimit > 0) {
+      const bucketKey = resolveRateLimitBucketKey(request, 'ingest');
+      const rateLimit = ingestRateLimiter(bucketKey, ingestLimit);
+      setRateLimitHeaders(reply, rateLimit, resolveRateLimitTier(request));
+      if (!rateLimit.allowed) {
+        return reply.status(429).send(respondError(traceId, 'RATE_LIMITED', 'Ingest rate limit exceeded'));
+      }
+    }
+
+    try {
+      const result = await deps.ingestService.enqueueBatch({
+        domains: parsed.data.domains,
+        traceId,
+        source: 'api',
+        priority: parsed.data.priority ?? 'normal',
+        forceRefresh: parsed.data.force_refresh,
+        forceAi: parsed.data.force_ai,
+        skipAi: parsed.data.skip_ai,
+      });
+
+      return reply.status(202).send({
+        ok: true,
+        data: {
+          accepted_count: result.accepted.length,
+          skipped_count: result.skipped.length,
+          invalid_count: result.invalid.length,
+          invalid_domains: result.invalid,
+        },
+        meta: {
+          trace_id: traceId,
+        },
+      });
+    } catch (error) {
+      if (isQueueCapacityError(error)) {
+        return reply.status(503).send(respondError(traceId, 'QUEUE_OVERLOADED', 'Queue capacity is temporarily exhausted. Retry soon.'));
+      }
+
+      return reply.status(500).send(respondError(traceId, 'INTERNAL_ERROR', 'Unexpected server error'));
+    }
   });
 
   app.get('/api/v1/sites/:domain', async (request, reply) => {
@@ -223,34 +582,34 @@ export const registerRoutes = (
       return reply.status(400).send(respondError(traceId, 'INVALID_DOMAIN', 'Domain is not valid'));
     }
 
-    const report = await deps.sites.getByDomain(domain);
+    const [report, crawlTarget] = await Promise.all([
+      deps.sites.getByDomain(domain),
+      deps.crawlTargets?.getByDomain(domain) ?? Promise.resolve(null),
+    ]);
 
     if (!report) {
       return reply.status(404).send(respondError(traceId, 'SITE_NOT_FOUND', 'Site report not found'));
     }
 
-    const sanitizedReport = sanitizeSiteReport(report);
-    const ttlSec = report.freshnessTtlSec ?? 604800;
-    const isStale = Date.now() - new Date(report.updatedAt).getTime() > ttlSec * 1000;
-
     const query = request.query as Record<string, string | undefined>;
-    const showDebug = query.debug === 'true';
+    const showDebug = query.debug === 'true' && isOpsRequest(request);
+    const sitePayload = await buildSiteReportResponse({ crawlTarget }, report);
+
+    if (sitePayload.data.enrichment.pending) {
+      reply.header('cache-control', 'no-store');
+    } else if (!showDebug) {
+      // Public report payloads are identical for every caller; let edges reuse them
+      // briefly so page views stop paying an origin round-trip on every hit.
+      reply.header('cache-control', 'public, s-maxage=120, stale-while-revalidate=600');
+    }
 
     return reply.send({
       ok: true,
-      data: {
-        domain: report.domain,
-        status: 'completed',
-        freshness: {
-          is_stale: isStale,
-          updated_at: report.updatedAt,
-        },
-        report: sanitizedReport,
-      },
+      data: sitePayload.data,
       meta: {
         trace_id: traceId,
-        timing: sanitizedReport._meta?.timing,
-        ...(showDebug && { debug: sanitizedReport._meta?.debug }),
+        timing: sitePayload.sanitizedReport._meta?.timing,
+        ...(showDebug && { debug: sitePayload.sanitizedReport._meta?.debug }),
       },
     });
   });
@@ -270,18 +629,18 @@ export const registerRoutes = (
       return reply.status(404).send(respondError(traceId, 'SITE_NOT_FOUND', 'Site report not found'));
     }
 
-    const sanitizedReport = sanitizeSiteReport(report);
+    const sanitizedReport = guardBlockedSiteReport(sanitizeSiteReport(report));
     const providers = VALID_PROVIDERS.map((name) => {
       const data = extractProviderData(sanitizedReport, name);
       const health = sanitizedReport.providerHealth?.find(h => h.provider.replace('.provider', '') === name);
       const completeness = getFieldCompleteness(data, PROVIDER_EXPECTED_FIELDS[name]);
       return {
         provider: name,
-        hasData: data !== null,
+        hasData: completeness.present > 0,
         health: health ? { ok: health.ok, errorCode: health.errorCode } : null,
         completeness,
       };
-    });
+    }).filter((item) => item.provider !== 'authority' || item.hasData || item.health);
 
     return reply.send({
       ok: true,
@@ -317,7 +676,7 @@ export const registerRoutes = (
       return reply.status(404).send(respondError(traceId, 'SITE_NOT_FOUND', 'Site report not found'));
     }
 
-    const sanitizedReport = sanitizeSiteReport(report);
+    const sanitizedReport = guardBlockedSiteReport(sanitizeSiteReport(report));
     const data = extractProviderData(sanitizedReport, providerName);
     const health = sanitizedReport.providerHealth?.find(h => h.provider.replace('.provider', '') === providerName);
     const completeness = getFieldCompleteness(data, PROVIDER_EXPECTED_FIELDS[providerName]);
@@ -328,7 +687,7 @@ export const registerRoutes = (
         domain: sanitizedReport.domain,
         provider: providerName,
         updatedAt: sanitizedReport.updatedAt,
-        hasData: data !== null,
+        hasData: completeness.present > 0,
         health: health ? { ok: health.ok, errorCode: health.errorCode } : null,
         completeness,
         data,
@@ -368,6 +727,40 @@ export const registerRoutes = (
     });
   });
 
+  app.get('/api/v1/sites/:domain/traffic-history', async (request, reply) => {
+    const traceId = request.id;
+    const inputDomain = String((request.params as Record<string, string>).domain ?? '').toLowerCase();
+    let domain: string;
+    try {
+      domain = normalizeDomain(inputDomain);
+    } catch {
+      return reply.status(400).send(respondError(traceId, 'INVALID_DOMAIN', 'Domain is not valid'));
+    }
+
+    const parsedQuery = trafficHistoryQuerySchema.safeParse(request.query);
+    if (!parsedQuery.success) {
+      return reply.status(400).send(respondError(traceId, 'INVALID_REQUEST', 'Invalid traffic history query'));
+    }
+
+    if (!deps.trafficHistoryService?.isConfigured()) {
+      return reply.status(503).send(respondError(traceId, 'TRAFFIC_HISTORY_UNAVAILABLE', 'Traffic history is not configured'));
+    }
+
+    const history = await deps.trafficHistoryService.getHistory(domain, parsedQuery.data);
+    if (!history) {
+      return reply.status(404).send(respondError(traceId, 'TRAFFIC_HISTORY_NOT_FOUND', 'Traffic history not found'));
+    }
+
+    reply.header('Cache-Control', 'public, s-maxage=600, stale-while-revalidate=1800');
+    return reply.send({
+      ok: true,
+      data: history,
+      meta: {
+        trace_id: traceId,
+      },
+    });
+  });
+
   app.get('/api/v1/jobs/:jobId', async (request, reply) => {
     const traceId = request.id;
     const jobId = String((request.params as Record<string, string>).jobId ?? '');
@@ -395,6 +788,9 @@ export const registerRoutes = (
         progress: job.progress,
         stage: job.stage,
         updated_at: job.updatedAt,
+        ...(job.status === 'failed' && job.errorMessage
+          ? { error: { code: 'JOB_FAILED', message: job.errorMessage } }
+          : {}),
       },
       meta: {
         trace_id: traceId,
@@ -427,6 +823,8 @@ export const registerRoutes = (
 
     const result = await deps.sites.searchDirectory(parsed.data.type, parsed.data.slug, page, pageSize, Object.keys(options).length > 0 ? options : undefined);
 
+    reply.header('cache-control', 'public, s-maxage=600, stale-while-revalidate=1800');
+
     return reply.send({
       ok: true,
       data: {
@@ -456,6 +854,8 @@ export const registerRoutes = (
 
     const stats = await deps.sites.getDirectoryStats(parsed.data.type, parsed.data.slug);
 
+    reply.header('cache-control', 'public, s-maxage=600, stale-while-revalidate=1800');
+
     return reply.send({
       ok: true,
       data: stats,
@@ -476,6 +876,8 @@ export const registerRoutes = (
 
     const summary = await deps.sites.getDirectoryTypeSummary(type as 'category' | 'technology' | 'topic', limit);
 
+    reply.header('cache-control', 'public, s-maxage=600, stale-while-revalidate=1800');
+
     return reply.send({
       ok: true,
       data: summary,
@@ -485,7 +887,18 @@ export const registerRoutes = (
 
   app.get('/api/v1/insights', async (request, reply) => {
     const traceId = request.id;
+    const limit = options?.insightsRateLimitPerMinute ?? 120;
+    if (limit > 0) {
+      const bucketKey = `insights:${request.ip || 'unknown'}`;
+      const rateLimit = insightsRateLimiter(bucketKey, limit);
+      setRateLimitHeaders(reply, rateLimit, 'anonymous');
+      if (!rateLimit.allowed) {
+        return reply.status(429).send(respondError(traceId, 'RATE_LIMITED', 'Insights rate limit exceeded'));
+      }
+    }
+
     const insights = await deps.sites.getGlobalInsights();
+    reply.header('Cache-Control', 'public, s-maxage=3600, stale-while-revalidate=3600');
     return reply.send({
       ok: true,
       data: insights,
@@ -526,6 +939,7 @@ export const registerRoutes = (
       ok: true,
       data: {
         queues: counts,
+        alerts: buildQueueFailureAlerts(counts),
       },
       meta: {
         trace_id: traceId,

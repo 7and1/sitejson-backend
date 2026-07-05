@@ -1,4 +1,6 @@
 import { buildApp } from './app.js';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { dirname } from 'node:path';
 import { IngestWorker } from './workers/ingest-worker.js';
 import { BrowserWorker } from './workers/browser-worker.js';
 import { AsyncWorker } from './workers/async-worker.js';
@@ -9,8 +11,10 @@ import { setupScheduledJobs } from './workers/scheduler.js';
 import { BrowserPool } from './core/browser-pool.js';
 import type { QueueName } from './queue/names.js';
 import { ALL_QUEUE_NAMES, QUEUE_NAMES } from './queue/names.js';
+import type { Logger } from './observability/logger.js';
 
 const SHUTDOWN_TIMEOUT_MS = 60_000;
+const HEARTBEAT_INTERVAL_MS = 10_000;
 
 const parseWorkerQueues = (raw?: string): Set<QueueName> | null => {
   if (!raw?.trim()) return null; // all queues
@@ -33,8 +37,38 @@ const parseWorkerQueues = (raw?: string): Set<QueueName> | null => {
   return valid.size > 0 ? valid : null;
 };
 
+const startHeartbeat = (
+  filePath: string | undefined,
+  logger: Logger,
+): ReturnType<typeof setInterval> | null => {
+  if (!filePath) {
+    return null;
+  }
+
+  const writeHeartbeat = async () => {
+    try {
+      await mkdir(dirname(filePath), { recursive: true });
+      await writeFile(filePath, `${new Date().toISOString()}\n`, { mode: 0o644 });
+    } catch (error) {
+      logger.warn({
+        module: 'worker',
+        event: 'heartbeat_write_failed',
+        file: filePath,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  };
+
+  void writeHeartbeat();
+  const timer = setInterval(() => {
+    void writeHeartbeat();
+  }, HEARTBEAT_INTERVAL_MS);
+  timer.unref();
+  return timer;
+};
+
 const startWorker = async () => {
-  const runtime = await buildApp();
+  const runtime = await buildApp(undefined, { runtimeRole: 'worker' });
 
   const allowedQueues = parseWorkerQueues(runtime.env.WORKER_QUEUES);
   const shouldRun = (q: QueueName) => !allowedQueues || allowedQueues.has(q);
@@ -71,6 +105,17 @@ const startWorker = async () => {
       runtime.env.AI_RETRY_FEED_BATCH_SIZE,
       runtime.env.AI_RETRY_FEED_MAX_RANK,
       runtime.env.AI_PROMPT_VERSION,
+      {
+        ingestAutoFeedEnabled: runtime.env.INGEST_AUTO_FEED_ENABLED,
+        aiRetryFeedEnabled: runtime.env.AI_RETRY_FEED_ENABLED,
+        backgroundBrowserMaxQueueDepth: runtime.env.BACKGROUND_BROWSER_MAX_QUEUE_DEPTH,
+        backgroundBrowserDailyBudget: runtime.env.BACKGROUND_BROWSER_DAILY_BUDGET,
+        aiRetryDailyBudget: runtime.env.AI_RETRY_DAILY_BUDGET,
+        redisFeedHardStopRatio: runtime.env.REDIS_FEED_HARD_STOP_RATIO,
+        staleActiveJobHours: runtime.env.CRAWL_JOB_REAPER_STALE_HOURS,
+        staleActiveJobLimit: runtime.env.CRAWL_JOB_REAPER_LIMIT,
+      },
+      runtime.dependencies.sites,
     );
     startPromises.push(ingestWorker.start());
   }
@@ -111,6 +156,8 @@ const startWorker = async () => {
       runtime.dependencies.jobs,
       runtime.orchestrator,
       runtime.logger,
+      runtime.env.AI_PROMPT_VERSION,
+      runtime.env.AHREFS_DR_CACHE_TTL_HOURS,
     );
     startPromises.push(asyncWorker.start());
   }
@@ -161,6 +208,7 @@ const startWorker = async () => {
       runtime.env.PROVIDER_RETRY_ATTEMPTS,
       runtime.env.PROVIDER_RETRY_BASE_MS,
       runtime.env.RADAR_BULK_BATCH_SIZE,
+      runtime.env.RADAR_BULK_MIN_VALID_ROWS,
     );
     startPromises.push(
       runtime.dependencies.queue.consume('radar', async (payload) => {
@@ -186,6 +234,7 @@ const startWorker = async () => {
 
   const activeQueues = allowedQueues ? [...allowedQueues].join(',') : 'all';
   runtime.logger.info({ module: 'worker', event: 'started', queues: activeQueues, browserPool: !!browserPool });
+  const heartbeatTimer = startHeartbeat(runtime.env.WORKER_HEARTBEAT_FILE, runtime.logger);
 
   // --- Graceful shutdown ---
   let isShuttingDown = false;
@@ -201,10 +250,13 @@ const startWorker = async () => {
     forceExitTimer.unref(); // Don't keep process alive just for the timer
 
     try {
+      await runtime.close();
+      if (heartbeatTimer) {
+        clearInterval(heartbeatTimer);
+      }
       if (browserPool) {
         await browserPool.close();
       }
-      await runtime.close();
       runtime.logger.info({ module: 'worker', event: 'shutdown_complete' });
     } catch (err) {
       runtime.logger.error({

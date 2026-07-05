@@ -1,0 +1,9 @@
+FROM sitejson-sitejson-api:latest
+
+USER root
+WORKDIR /app
+
+COPY dist ./dist
+RUN chown -R pwuser:pwuser /app/dist
+
+USER pwuser

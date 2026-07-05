@@ -1,10 +1,68 @@
 import type { SiteReport } from '../core/types.js';
 
+const normalizeTxtRecord = (value: string): string => (
+  value
+    .trim()
+    .replace(/^"+|"+$/g, '')
+    .replace(/\s+/g, ' ')
+    .toLowerCase()
+);
+
+const getEmailAuthSignals = (report: SiteReport): {
+  hasSpf: boolean;
+  hasDmarc: boolean;
+  hasDkim: boolean;
+} => {
+  const txtRecords = (report.dns?.txtRecords ?? []).map(normalizeTxtRecord);
+
+  return {
+    hasSpf: txtRecords.some((record) => record.startsWith('v=spf1')),
+    hasDmarc: txtRecords.some((record) => record.startsWith('v=dmarc1')),
+    hasDkim: txtRecords.some((record) => record.startsWith('v=dkim1')),
+  };
+};
+
+const countAiCorroborationSignals = (report: SiteReport): number => {
+  let count = 0;
+  const emailAuth = getEmailAuthSignals(report);
+
+  if ((report.dns?.aRecords?.length ?? 0) > 0 || (report.dns?.aaaaRecords?.length ?? 0) > 0) count += 1;
+  if ((report.dns?.caaRecords?.length ?? 0) > 0) count += 1;
+  if ((report.dns?.mxRecords?.length ?? 0) > 0) count += 1;
+  if ((report.dns?.nsRecords?.length ?? 0) > 0) count += 1;
+  if (emailAuth.hasSpf) count += 1;
+  if (emailAuth.hasDmarc) count += 1;
+  if (emailAuth.hasDkim) count += 1;
+  if ((report.files?.robotsSitemapUrls?.length ?? 0) > 0) count += 1;
+  if ((report.publisher?.directCount ?? 0) > 0) count += 1;
+  if ((report.trafficData?.domainAgeYears ?? 0) >= 1) count += 1;
+
+  const globalRank = report.trafficData?.globalRank ?? report.radar?.globalRank;
+  if (globalRank != null && globalRank > 0) count += 1;
+
+  if (typeof report.authority?.domainRating === 'number' && report.authority.domainRating >= 30) {
+    count += 1;
+  }
+
+  return count;
+};
+
 export const calculateLegitimacyScore = (report: SiteReport): { value: number; signals: string[] } => {
   let score = 10;
   const signals: string[] = ['baseline'];
+  const emailAuth = getEmailAuthSignals(report);
 
   // DNS signals
+  if ((report.dns?.aRecords?.length ?? 0) > 0 || (report.dns?.aaaaRecords?.length ?? 0) > 0) {
+    score += 3;
+    signals.push('has_address_records');
+  }
+
+  if ((report.dns?.caaRecords?.length ?? 0) > 0) {
+    score += 2;
+    signals.push('has_caa');
+  }
+
   if ((report.dns?.mxRecords?.length ?? 0) > 0) {
     score += 10;
     signals.push('has_mx');
@@ -13,6 +71,21 @@ export const calculateLegitimacyScore = (report: SiteReport): { value: number; s
   if ((report.dns?.nsRecords?.length ?? 0) > 0) {
     score += 5;
     signals.push('has_ns');
+  }
+
+  if (emailAuth.hasSpf) {
+    score += 3;
+    signals.push('has_spf');
+  }
+
+  if (emailAuth.hasDmarc) {
+    score += 4;
+    signals.push('has_dmarc');
+  }
+
+  if (emailAuth.hasDkim) {
+    score += 3;
+    signals.push('has_dkim');
   }
 
   // Content structure signals
@@ -101,15 +174,25 @@ export const calculateLegitimacyScore = (report: SiteReport): { value: number; s
     signals.push('domain_held');
   }
 
-  // AI analysis signals (reduced weight)
+  const aiCorroborationSignals = countAiCorroborationSignals(report);
+
+  // AI analysis signals are capped and require corroboration from non-AI signals.
   if (report.aiAnalysis?.risk?.sentiment === 'Professional') {
-    score += 15;
-    signals.push('ai_professional');
+    if (aiCorroborationSignals >= 2) {
+      score += 6;
+      signals.push('ai_professional');
+    } else {
+      signals.push('ai_professional_unconfirmed');
+    }
   }
 
   if (report.aiAnalysis?.risk?.isSpam) {
-    score -= 30;
-    signals.push('spam_signal');
+    if (aiCorroborationSignals >= 1) {
+      score -= 10;
+      signals.push('spam_signal');
+    } else {
+      signals.push('spam_signal_unconfirmed');
+    }
   }
 
   return {
@@ -117,3 +200,8 @@ export const calculateLegitimacyScore = (report: SiteReport): { value: number; s
     signals,
   };
 };
+
+export const withCalculatedLegitimacyScore = (report: SiteReport): SiteReport => ({
+  ...report,
+  score: calculateLegitimacyScore(report),
+});

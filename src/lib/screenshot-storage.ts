@@ -7,6 +7,7 @@ export type ScreenshotStorageMode = 'local' | 'r2';
 export interface ScreenshotStorageConfig {
   mode: ScreenshotStorageMode;
   localDir: string;
+  publicBaseUrl?: string;
 }
 
 const sanitizeDomain = (domain: string): string => domain.toLowerCase().replace(/[^a-z0-9]/g, '_');
@@ -28,13 +29,18 @@ export class ScreenshotStorage {
     }
 
     await mkdir(this.config.localDir, { recursive: true });
-    const filename = `${sanitizeDomain(domain)}.png`;
+    const key = sanitizeDomain(domain);
+    const filename = `${key}.webp`;
     const filepath = path.join(this.config.localDir, filename);
     await writeFile(filepath, buffer);
+
+    const base = this.config.publicBaseUrl?.replace(/\/+$/, '');
+    const screenshotUrl = base ? `${base}/snapshots/${key}.webp` : undefined;
 
     return {
       storage: 'local',
       screenshotPath: filepath,
+      screenshotUrl,
     };
   }
 }

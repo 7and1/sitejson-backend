@@ -41,7 +41,7 @@ describe('InMemorySiteRepository.findAlternatives', () => {
     const result = await repo.findAlternatives('target.com', 6);
 
     expect(result).not.toBeNull();
-    expect(result?.algorithm).toBe('rule_based');
+    expect(result?.algorithm).toBe('semantic_embedding');
     // alt-strong and alt-weak are same category, other-category matches via tag overlap
     const domains = result?.items.map((item) => item.domain) ?? [];
     expect(domains).toContain('alt-strong.com');
@@ -70,7 +70,7 @@ describe('InMemorySiteRepository.findAlternatives', () => {
     const result = await repo.findAlternatives('no-signals.com', 6);
 
     expect(result).not.toBeNull();
-    expect(result?.algorithm).toBe('rule_based');
+    expect(result?.algorithm).toBe('semantic_embedding');
     expect(result?.items).toEqual([]);
   });
 

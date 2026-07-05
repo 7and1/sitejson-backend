@@ -6,8 +6,8 @@ import { QUEUE_NAMES, type QueueName } from '../queue/names.js';
 import type { CrawlTargetRepository, JobRepository, SiteRepository } from '../storage/interfaces.js';
 import type { Orchestrator } from '../core/orchestrator.js';
 import { computeContentHash } from '../services/content-hash.js';
-import { mergeSiteReports } from '../services/report-merge.js';
 import { buildAiSeedSignals } from '../services/ai-seed-signals.js';
+import { notifyAnalyzeCompleted, notifyAnalyzeFailed } from '../services/analyze-webhook.js';
 import { randomUUID } from 'node:crypto';
 
 export class BrowserWorker {
@@ -50,8 +50,10 @@ export class BrowserWorker {
         );
       }
 
-      const previous = await this.sites.getByDomain(domain);
-      const crawlTarget = await this.crawlTargets.getByDomain(domain);
+      const [previous, crawlTarget] = await Promise.all([
+        this.sites.getByDomain(domain),
+        this.crawlTargets.getByDomain(domain),
+      ]);
       const isHighValue = payload.isHighValue ?? crawlTarget?.isHighValue;
       const radarRank = crawlTarget?.radarRank;
       const aiSeedSignals = isAiReclassify ? buildAiSeedSignals(domain, previous) : undefined;
@@ -71,7 +73,7 @@ export class BrowserWorker {
         radarRank,
       });
 
-      await this.sites.upsert(mergeSiteReports(previous, report));
+      await this.sites.upsert(report, { previousReport: previous });
       if (!isAiReclassify) {
         await this.crawlTargets.markLayerResult(domain, 'browser', 'success');
       }
@@ -84,19 +86,31 @@ export class BrowserWorker {
             primaryH1: report._meta?.html?.primary_h1,
             contentLength: report._meta?.html?.length,
           });
+      const promptVersionChanged = Boolean(
+        typeof crawlTarget?.taxonomyPromptVersion === 'number'
+          && crawlTarget.taxonomyPromptVersion < this.taxonomyPromptVersion,
+      );
+      const hashChanged = Boolean(
+        contentHash
+          && crawlTarget?.lastContentHash
+          && crawlTarget.lastContentHash !== contentHash,
+      );
+      const shouldSkipAsyncAi = Boolean(
+        payload.skipAi
+          || (
+            contentHash
+            && crawlTarget?.lastContentHash === contentHash
+            && crawlTarget?.taxonomyData
+            && !promptVersionChanged
+          ),
+      );
+      const lastContentHashPatch = isAiReclassify
+        ? contentHash ?? undefined
+        : contentHash ?? null;
 
       // Save taxonomy if AI ran
       if (report.taxonomy) {
         const hasTaxonomy = Boolean(crawlTarget?.taxonomyData);
-        const promptVersionChanged = Boolean(
-          typeof crawlTarget?.taxonomyPromptVersion === 'number'
-            && crawlTarget.taxonomyPromptVersion < this.taxonomyPromptVersion,
-        );
-        const hashChanged = Boolean(
-          contentHash
-            && crawlTarget?.lastContentHash
-            && crawlTarget.lastContentHash !== contentHash,
-        );
 
         const triggerReason = this.resolveTriggerReason({
           forceAi: effectiveForceAi,
@@ -118,12 +132,12 @@ export class BrowserWorker {
           taxonomyPromptVersion: this.taxonomyPromptVersion,
           taxonomyLastTriggerReason: triggerReason ?? undefined,
           taxonomySourceLane: 'browser',
-          lastContentHash: contentHash ?? undefined,
+          lastContentHash: lastContentHashPatch,
         });
       } else {
         if (!isAiReclassify) {
           await this.crawlTargets.update(domain, {
-            lastContentHash: contentHash ?? undefined,
+            lastContentHash: lastContentHashPatch,
           });
         }
       }
@@ -133,7 +147,6 @@ export class BrowserWorker {
         const asyncScreenshotUrl = report.visual?.screenshotUrl ?? undefined;
         await this.queue.enqueue({
           jobId: randomUUID(),
-          crawlJobId,
           domain,
           traceId,
           parentJobId: payload.jobId,
@@ -142,7 +155,8 @@ export class BrowserWorker {
           purpose: 'async-fill',
           screenshotUrl: asyncScreenshotUrl,
           forceRefresh: payload.forceRefresh,
-          skipAi: payload.skipAi,
+          skipAi: shouldSkipAsyncAi,
+          contentHash: contentHash ?? undefined,
         }, QUEUE_NAMES.async);
       }
 
@@ -152,6 +166,20 @@ export class BrowserWorker {
           isAiReclassify ? 'ai_reclassify_completed' : 'browser_completed',
           100,
         );
+        if (!isAiReclassify) {
+          await notifyAnalyzeCompleted({
+            sites: this.sites,
+            crawlTargets: this.crawlTargets,
+            logger: this.logger,
+          }, {
+            webhookUrl: payload.webhookUrl,
+            jobId: crawlJobId,
+            domain,
+            traceId,
+            priority: payload.priority,
+            stage: 'browser_completed',
+          });
+        }
       }
 
       this.logger.info({
@@ -166,11 +194,23 @@ export class BrowserWorker {
         await this.crawlTargets.markLayerResult(domain, 'browser', 'failed');
       }
       if (crawlJobId) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
         await this.jobs.markFailed(
           crawlJobId,
-          error instanceof Error ? error.message : String(error),
+          errorMessage,
           isAiReclassify ? 'ai_reclassify_failed' : 'browser_failed',
         );
+        if (!isAiReclassify) {
+          await notifyAnalyzeFailed({ logger: this.logger }, {
+            webhookUrl: payload.webhookUrl,
+            jobId: crawlJobId,
+            domain,
+            traceId,
+            priority: payload.priority,
+            stage: 'browser_failed',
+            errorMessage,
+          });
+        }
       }
       this.logger.error({
         trace_id: traceId,

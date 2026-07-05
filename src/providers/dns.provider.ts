@@ -39,6 +39,8 @@ const inferDnsProvider = (records: string[]): string => {
   return records.length > 0 ? 'Other' : 'Unknown';
 };
 
+const dedupeRecords = (records: string[]): string[] => Array.from(new Set(records));
+
 export class DnsProvider implements Provider<DnsData> {
   readonly name = 'dns.provider';
 
@@ -49,19 +51,31 @@ export class DnsProvider implements Provider<DnsData> {
 
     try {
       const results = await Promise.allSettled([
+        this.query(ctx.domain, 'A'),
+        this.query(ctx.domain, 'AAAA'),
+        this.query(ctx.domain, 'CAA'),
         this.query(ctx.domain, 'MX'),
         this.query(ctx.domain, 'NS'),
         this.query(ctx.domain, 'TXT'),
+        this.query(`_dmarc.${ctx.domain}`, 'TXT'),
       ]);
 
-      const mxRecords = results[0].status === 'fulfilled' ? results[0].value : [];
-      const nsRecords = results[1].status === 'fulfilled' ? results[1].value : [];
-      const txtRecords = results[2].status === 'fulfilled' ? results[2].value : [];
+      const aRecords = results[0].status === 'fulfilled' ? results[0].value : [];
+      const aaaaRecords = results[1].status === 'fulfilled' ? results[1].value : [];
+      const caaRecords = results[2].status === 'fulfilled' ? results[2].value : [];
+      const mxRecords = results[3].status === 'fulfilled' ? results[3].value : [];
+      const nsRecords = results[4].status === 'fulfilled' ? results[4].value : [];
+      const rootTxtRecords = results[5].status === 'fulfilled' ? results[5].value : [];
+      const dmarcTxtRecords = results[6].status === 'fulfilled' ? results[6].value : [];
+      const txtRecords = dedupeRecords([...rootTxtRecords, ...dmarcTxtRecords]);
 
-      const providerSignal = [...mxRecords, ...nsRecords, ...txtRecords];
+      const providerSignal = [...aRecords, ...aaaaRecords, ...caaRecords, ...mxRecords, ...nsRecords, ...txtRecords];
 
       return providerSuccess(this.name, startedAt, {
         provider: inferDnsProvider(providerSignal),
+        aRecords,
+        aaaaRecords,
+        caaRecords,
         mxRecords,
         nsRecords,
         txtRecords,
@@ -76,7 +90,7 @@ export class DnsProvider implements Provider<DnsData> {
     }
   }
 
-  private async query(domain: string, type: 'MX' | 'NS' | 'TXT'): Promise<string[]> {
+  private async query(domain: string, type: 'A' | 'AAAA' | 'CAA' | 'MX' | 'NS' | 'TXT'): Promise<string[]> {
     const url = `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain)}&type=${type}`;
     const response = await fetchWithRetry(url, {
       timeoutMs: this.options.timeoutMs ?? 15000,
