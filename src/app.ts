@@ -524,6 +524,8 @@ export const buildApp = async (
       timeoutMs: env.PROVIDER_TIMEOUT_MS,
       providerQuickTimeoutMs: env.PROVIDER_TIMEOUT_MS_FAST,
       aiTimeoutMs: env.AI_TIMEOUT_MS,
+      // worst case is a sequential lookup + compute round-trip
+      historyTimeoutMs: env.ARCHIVE_HISTORY_TIMEOUT_MS * 2 + 2000,
       retryAttempts: env.PROVIDER_RETRY_ATTEMPTS,
       retryBaseMs: env.PROVIDER_RETRY_BASE_MS,
       userAgent: env.USER_AGENT,

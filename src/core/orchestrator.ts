@@ -65,6 +65,7 @@ type RuntimeOptions = {
   timeoutMs: number;
   providerQuickTimeoutMs: number;
   aiTimeoutMs: number;
+  historyTimeoutMs?: number;
   retryAttempts: number;
   retryBaseMs: number;
   userAgent: string;
@@ -94,10 +95,20 @@ const QUICK_DEADLINE_PROVIDERS = new Set([
 
 export const resolveProviderDeadlineMs = (
   providerName: string,
-  runtimeOptions: Pick<RuntimeOptions, 'timeoutMs' | 'providerQuickTimeoutMs' | 'aiTimeoutMs'>,
+  runtimeOptions: Pick<RuntimeOptions, 'timeoutMs' | 'providerQuickTimeoutMs' | 'aiTimeoutMs' | 'historyTimeoutMs'>,
 ): number => {
   if (providerName === 'ai.provider') {
     return Math.max(1, Math.trunc(runtimeOptions.aiTimeoutMs));
+  }
+
+  if (providerName === 'history.provider') {
+    // compute-on-miss blocks on ArchiveRisk's inline CDX compute, which can
+    // outlast the global provider deadline; never go below the global value
+    return Math.max(
+      Math.trunc(runtimeOptions.timeoutMs),
+      Math.trunc(runtimeOptions.historyTimeoutMs ?? runtimeOptions.timeoutMs),
+      1,
+    );
   }
 
   if (QUICK_DEADLINE_PROVIDERS.has(providerName)) {

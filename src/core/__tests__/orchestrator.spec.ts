@@ -83,6 +83,12 @@ describe('resolveProviderDeadlineMs', () => {
     expect(resolveProviderDeadlineMs('traffic.provider', runtimeOptions)).toBe(100);
     expect(resolveProviderDeadlineMs('ai.provider', runtimeOptions)).toBe(250);
   });
+
+  it('extends the history deadline for compute-on-miss without going below the global timeout', () => {
+    expect(resolveProviderDeadlineMs('history.provider', runtimeOptions)).toBe(100);
+    expect(resolveProviderDeadlineMs('history.provider', { ...runtimeOptions, historyTimeoutMs: 400 })).toBe(400);
+    expect(resolveProviderDeadlineMs('history.provider', { ...runtimeOptions, historyTimeoutMs: 50 })).toBe(100);
+  });
 });
 
 describe('shouldAllowBrowserRequestUrl', () => {
