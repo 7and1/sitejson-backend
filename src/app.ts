@@ -36,6 +36,7 @@ import {
   AdsProvider,
   AhrefsDomainRatingProvider,
   AiProvider,
+  ArchiveHistoryProvider,
   DnsProvider,
   FilesProvider,
   MetaProvider,
@@ -432,6 +433,19 @@ export const buildApp = async (
         providerOptions,
         env.USER_AGENT,
         env.AHREFS_DR_ENDPOINT,
+      ),
+    ] : []),
+    ...(env.ARCHIVE_HISTORY_ENABLED ? [
+      new ArchiveHistoryProvider(
+        {
+          enabled: env.ARCHIVE_HISTORY_ENABLED,
+          baseUrl: env.ARCHIVE_HISTORY_BASE_URL,
+          apiKey: env.ARCHIVE_HISTORY_API_KEY,
+          computeOnMiss: env.ARCHIVE_HISTORY_COMPUTE_ON_MISS,
+          maxTitles: env.ARCHIVE_HISTORY_MAX_TITLES,
+          timeoutMs: env.ARCHIVE_HISTORY_TIMEOUT_MS,
+        },
+        providerOptions,
       ),
     ] : []),
     new TrafficProvider(

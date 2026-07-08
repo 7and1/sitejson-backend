@@ -62,6 +62,42 @@ export interface AuthorityData {
   fetchedAt: string;
 }
 
+export type HistoryStatus = 'ready' | 'pending' | 'failed' | 'miss';
+export type HistoryVerdict = 'reject' | 'review' | 'watch' | 'likely_clean' | 'no_data';
+
+export interface HistoryTitleSample {
+  year: number;
+  timestamp: string;
+  title: string;
+  archiveUrl: string;
+}
+
+export interface HistoryData {
+  status: HistoryStatus;
+  source: 'archiverisk';
+  cacheHit: boolean;
+  archiveScore: number | null;
+  archiveScoreBand: 'clean' | 'watch' | 'review' | 'reject' | 'no_data';
+  archiveVerdict: HistoryVerdict;
+  label: string;
+  language: string;
+  sensitiveWords: string[];
+  riskFlags: string[];
+  firstCaptureYear: number | null;
+  lastCaptureYear: number | null;
+  historyAgeMonths: number;
+  longestStreakYears: number;
+  distinctBuildingYears: number;
+  recentYearsBuilt: number;
+  capturesCount: number;
+  yearHistogram: Array<{
+    year: number;
+    count: number;
+  }>;
+  titles: HistoryTitleSample[];
+  computedAt: string | null;
+}
+
 export interface RadarData {
   globalRank: number | null;
   rankBucket?: string;
@@ -208,6 +244,37 @@ const authoritySchema = z.object({
   fetchedAt: z.string(),
 });
 
+const historySchema = z.object({
+  status: z.enum(['ready', 'pending', 'failed', 'miss']),
+  source: z.literal('archiverisk'),
+  cacheHit: z.boolean(),
+  archiveScore: z.number().min(0).max(100).nullable(),
+  archiveScoreBand: z.enum(['clean', 'watch', 'review', 'reject', 'no_data']),
+  archiveVerdict: z.enum(['reject', 'review', 'watch', 'likely_clean', 'no_data']),
+  label: z.string(),
+  language: z.string(),
+  sensitiveWords: z.array(z.string()),
+  riskFlags: z.array(z.string()),
+  firstCaptureYear: z.number().int().nullable(),
+  lastCaptureYear: z.number().int().nullable(),
+  historyAgeMonths: z.number().int().min(0),
+  longestStreakYears: z.number().int().min(0),
+  distinctBuildingYears: z.number().int().min(0),
+  recentYearsBuilt: z.number().int().min(0),
+  capturesCount: z.number().int().min(0),
+  yearHistogram: z.array(z.object({
+    year: z.number().int(),
+    count: z.number().int().min(0),
+  })),
+  titles: z.array(z.object({
+    year: z.number().int(),
+    timestamp: z.string(),
+    title: z.string(),
+    archiveUrl: z.string().url(),
+  })),
+  computedAt: z.string().nullable(),
+});
+
 const radarSchema = z.object({
   globalRank: z.number().nullable(),
   rankBucket: z.string().optional(),
@@ -324,6 +391,11 @@ export const parsePublisherData = (value: unknown): PublisherData | null => {
 export const parseAuthorityData = (value: unknown): AuthorityData | null => {
   const parsed = authoritySchema.safeParse(value);
   return parsed.success ? (parsed.data as AuthorityData) : null;
+};
+
+export const parseHistoryData = (value: unknown): HistoryData | null => {
+  const parsed = historySchema.safeParse(value);
+  return parsed.success ? (parsed.data as HistoryData) : null;
 };
 
 export const parseRadarData = (value: unknown): RadarData | null => {

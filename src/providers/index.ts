@@ -6,6 +6,7 @@ export { SeoProvider } from './seo.provider.js';
 export { DnsProvider } from './dns.provider.js';
 export { AdsProvider } from './ads.provider.js';
 export { AhrefsDomainRatingProvider } from './authority.provider.js';
+export { ArchiveHistoryProvider } from './history.provider.js';
 export { PublisherProvider } from './publisher.provider.js';
 export { FilesProvider } from './files.provider.js';
 export { TrafficProvider } from './traffic.provider.js';
@@ -22,6 +23,10 @@ export type {
   VisualData,
   AdsData,
   AuthorityData,
+  HistoryData,
+  HistoryStatus,
+  HistoryTitleSample,
+  HistoryVerdict,
   PublisherData,
   RadarData,
   AiData,

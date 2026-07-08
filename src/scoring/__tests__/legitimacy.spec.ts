@@ -216,4 +216,73 @@ describe('calculateLegitimacyScore', () => {
     expect(result.signals).toContain('ai_professional');
     expect(result.value).toBeGreaterThan(10);
   });
+
+  it('adds positive history signals for long-lived archive coverage', () => {
+    const result = calculateLegitimacyScore({
+      domain: 'history.example',
+      updatedAt: new Date().toISOString(),
+      history: {
+        status: 'ready',
+        source: 'archiverisk',
+        cacheHit: true,
+        archiveScore: 78,
+        archiveScoreBand: 'clean',
+        archiveVerdict: 'likely_clean',
+        label: 'Real business',
+        language: 'English',
+        sensitiveWords: [],
+        riskFlags: [],
+        firstCaptureYear: 2010,
+        lastCaptureYear: 2026,
+        historyAgeMonths: 120,
+        longestStreakYears: 12,
+        distinctBuildingYears: 10,
+        recentYearsBuilt: 5,
+        capturesCount: 12,
+        yearHistogram: [{ year: 2026, count: 2 }],
+        titles: [],
+        computedAt: '2026-07-06T00:00:00.000Z',
+      },
+    });
+
+    expect(result.signals).toContain('history_long_lived');
+    expect(result.signals).toContain('history_very_long_lived');
+    expect(result.signals).toContain('history_established');
+    expect(result.value).toBeGreaterThan(10);
+  });
+
+  it('applies negative history signals for archive abuse and pollution', () => {
+    const result = calculateLegitimacyScore({
+      domain: 'abuse-history.example',
+      updatedAt: new Date().toISOString(),
+      history: {
+        status: 'ready',
+        source: 'archiverisk',
+        cacheHit: true,
+        archiveScore: 12,
+        archiveScoreBand: 'reject',
+        archiveVerdict: 'reject',
+        label: 'Abuse history',
+        language: 'English',
+        sensitiveWords: ['gambling'],
+        riskFlags: ['gambling_history', 'recent_pollution', 'parking_only', 'theme_drift'],
+        firstCaptureYear: 2020,
+        lastCaptureYear: 2026,
+        historyAgeMonths: 48,
+        longestStreakYears: 6,
+        distinctBuildingYears: 4,
+        recentYearsBuilt: 2,
+        capturesCount: 8,
+        yearHistogram: [{ year: 2026, count: 3 }],
+        titles: [],
+        computedAt: '2026-07-06T00:00:00.000Z',
+      },
+    });
+
+    expect(result.signals).toContain('history_prior_abuse');
+    expect(result.signals).toContain('history_recent_pollution');
+    expect(result.signals).toContain('history_parking_only');
+    expect(result.signals).toContain('history_theme_drift');
+    expect(result.value).toBeLessThan(10);
+  });
 });

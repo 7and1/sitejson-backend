@@ -163,6 +163,41 @@ describe('Orchestrator', () => {
         }),
       },
       {
+        name: 'history.provider',
+        run: async () => ({
+          provider: 'history.provider',
+          ok: true,
+          latencyMs: 1,
+          data: {
+            status: 'ready',
+            source: 'archiverisk',
+            cacheHit: true,
+            archiveScore: 81,
+            archiveScoreBand: 'clean',
+            archiveVerdict: 'likely_clean',
+            label: 'Real business',
+            language: 'English',
+            sensitiveWords: [],
+            riskFlags: ['real_business'],
+            firstCaptureYear: 2012,
+            lastCaptureYear: 2026,
+            historyAgeMonths: 120,
+            longestStreakYears: 10,
+            distinctBuildingYears: 9,
+            recentYearsBuilt: 5,
+            capturesCount: 14,
+            yearHistogram: [{ year: 2026, count: 2 }],
+            titles: [{
+              year: 2026,
+              timestamp: '20260101120000',
+              title: 'Example',
+              archiveUrl: 'https://web.archive.org/web/20260101120000/https://example.com',
+            }],
+            computedAt: '2026-07-06T00:00:00.000Z',
+          },
+        }),
+      },
+      {
         name: 'radar.provider',
         run: async () => ({
           provider: 'radar.provider',
@@ -259,6 +294,8 @@ describe('Orchestrator', () => {
     expect(report.taxonomy?.iabCategory).toBe('Technology & Computing');
     expect(report.authority?.domainRating).toBe(93);
     expect(report.authority?.attribution).toBe('Domain Rating by Ahrefs');
+    expect(report.history?.archiveVerdict).toBe('likely_clean');
+    expect(report.history?.titles[0]?.title).toBe('Example');
     expect(report.radar?.globalRank).toBe(5000);
     expect(report.trafficData?.whois?.registrar).toBe('Example Registrar');
     expect(report.trafficData?.domainAgeYears).toBe(5.4);

@@ -1,3 +1,5 @@
+import type { HistoryData } from '../providers/types.js';
+
 export type JobStatus = 'pending' | 'running' | 'completed' | 'failed';
 
 export type TaxonomyTriggerReason = 'force_ai' | 'first_run' | 'hash_changed' | 'prompt_upgrade';
@@ -136,6 +138,7 @@ export interface SiteReport {
     attribution?: 'Domain Rating by Ahrefs';
     fetchedAt?: string;
   };
+  history?: HistoryData;
   trafficData?: {
     monthlyVisits?: number;
     globalRank?: number | null;

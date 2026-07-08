@@ -1,6 +1,7 @@
 import type { SiteReport } from '../core/types.js';
 
 type TrafficData = NonNullable<SiteReport['trafficData']>;
+type HistoryData = NonNullable<SiteReport['history']>;
 type WhoisRecord = NonNullable<TrafficData['whois']>;
 type ProviderHealthItem = NonNullable<SiteReport['providerHealth']>[number];
 
@@ -226,6 +227,22 @@ const mergeObject = <T extends object>(previous: T | undefined, next: T | undefi
   };
 };
 
+const mergeHistory = (
+  previous: HistoryData | undefined,
+  next: HistoryData | undefined,
+): HistoryData | undefined => {
+  if (!previous) {
+    return next;
+  }
+  if (!next || next.status === 'miss') {
+    return previous;
+  }
+  if (previous.status === 'ready' && (next.status === 'pending' || next.status === 'failed')) {
+    return previous;
+  }
+  return next;
+};
+
 const mergeTrafficData = (
   previous: SiteReport['trafficData'],
   next: SiteReport['trafficData'],
@@ -412,6 +429,7 @@ export const mergeSiteReports = (previous: SiteReport | null, next: SiteReport):
     ads: mergeObject(sanitizedPrevious.ads, effectiveNext.ads),
     publisher: mergeObject(sanitizedPrevious.publisher, effectiveNext.publisher),
     authority: mergeObject(sanitizedPrevious.authority, effectiveNext.authority),
+    history: mergeHistory(sanitizedPrevious.history, effectiveNext.history),
     trafficData: mergedTrafficData
       ? {
           ...mergedTrafficData,

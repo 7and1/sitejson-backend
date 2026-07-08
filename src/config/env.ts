@@ -272,6 +272,12 @@ const envSchema = z.object({
   TRAFFIC_SIMILARWEB_API_KEY: z.string().optional().transform(v => v?.trim() || undefined),
   TRAFFIC_SIMILARWEB_MAX_AGE_DAYS: z.coerce.number().int().min(1).max(365).default(30),
   TRAFFIC_SIMILARWEB_TIMEOUT_MS: z.coerce.number().int().positive().default(12000),
+  ARCHIVE_HISTORY_ENABLED: booleanFromEnv(false),
+  ARCHIVE_HISTORY_BASE_URL: z.preprocess(blankToUndefined, z.string().optional()),
+  ARCHIVE_HISTORY_API_KEY: z.string().optional().transform(v => v?.trim() || undefined),
+  ARCHIVE_HISTORY_COMPUTE_ON_MISS: booleanFromEnv(false),
+  ARCHIVE_HISTORY_MAX_TITLES: z.coerce.number().int().min(1).max(50).default(12),
+  ARCHIVE_HISTORY_TIMEOUT_MS: z.coerce.number().int().positive().default(4000),
   TRAFFIC_ROTATION_MAX_PRIMARY_PROXIES: z.coerce.number().int().min(1).max(12).default(4),
   AHREFS_DR_ENABLED: booleanFromEnv(false),
   AHREFS_DR_ENDPOINT: z.preprocess(

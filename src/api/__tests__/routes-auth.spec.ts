@@ -375,7 +375,7 @@ describe('registerRoutes auth hook', () => {
     await isolatedApp.close();
   });
 
-  it('exposes authority provider data and omits it from summary when absent and not run', async () => {
+  it('exposes authority and history provider data and omits them from summary when absent and not run', async () => {
     const siteRepo = new InMemorySiteRepository();
     await siteRepo.upsert({
       domain: 'example.com',
@@ -387,8 +387,36 @@ describe('registerRoutes auth hook', () => {
         attribution: 'Domain Rating by Ahrefs',
         fetchedAt: '2026-06-14T00:00:00.000Z',
       },
+      history: {
+        status: 'ready',
+        source: 'archiverisk',
+        cacheHit: true,
+        archiveScore: 83,
+        archiveScoreBand: 'clean',
+        archiveVerdict: 'likely_clean',
+        label: 'Real business',
+        language: 'English',
+        sensitiveWords: [],
+        riskFlags: ['real_business'],
+        firstCaptureYear: 2012,
+        lastCaptureYear: 2026,
+        historyAgeMonths: 120,
+        longestStreakYears: 10,
+        distinctBuildingYears: 8,
+        recentYearsBuilt: 5,
+        capturesCount: 14,
+        yearHistogram: [{ year: 2026, count: 2 }],
+        titles: [{
+          year: 2026,
+          timestamp: '20260101120000',
+          title: 'Example',
+          archiveUrl: 'https://web.archive.org/web/20260101120000/https://example.com',
+        }],
+        computedAt: '2026-07-06T00:00:00.000Z',
+      },
       providerHealth: [
         { provider: 'authority.provider', ok: true },
+        { provider: 'history.provider', ok: true },
       ],
     });
     await siteRepo.upsert({
@@ -429,6 +457,16 @@ describe('registerRoutes auth hook', () => {
         missing: 0,
       },
     });
+    const historyProvider = providersResponse.json().data.providers.find((item: { provider: string }) => item.provider === 'history');
+    expect(historyProvider).toMatchObject({
+      hasData: true,
+      health: { ok: true },
+      completeness: {
+        total: 7,
+        present: 7,
+        missing: 0,
+      },
+    });
 
     const detailResponse = await isolatedApp.inject({
       method: 'GET',
@@ -441,6 +479,18 @@ describe('registerRoutes auth hook', () => {
       attribution: 'Domain Rating by Ahrefs',
     });
 
+    const historyDetailResponse = await isolatedApp.inject({
+      method: 'GET',
+      url: '/api/v1/sites/example.com/providers/history',
+      headers: { 'x-api-key': 'test-api-key' },
+    });
+    expect(historyDetailResponse.statusCode).toBe(200);
+    expect(historyDetailResponse.json().data.data).toMatchObject({
+      archiveVerdict: 'likely_clean',
+      archiveScore: 83,
+      titles: [expect.objectContaining({ title: 'Example' })],
+    });
+
     const absentResponse = await isolatedApp.inject({
       method: 'GET',
       url: '/api/v1/sites/missing-authority.com/providers',
@@ -448,6 +498,7 @@ describe('registerRoutes auth hook', () => {
     });
     expect(absentResponse.statusCode).toBe(200);
     expect(absentResponse.json().data.providers.some((item: { provider: string }) => item.provider === 'authority')).toBe(false);
+    expect(absentResponse.json().data.providers.some((item: { provider: string }) => item.provider === 'history')).toBe(false);
 
     await isolatedApp.close();
   });

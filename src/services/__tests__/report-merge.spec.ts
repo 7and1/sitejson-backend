@@ -238,6 +238,68 @@ describe('mergeSiteReports', () => {
     expect(merged.seo?.h2Count).toBe(5);
   });
 
+  it('keeps a ready history snapshot when a later async merge only has pending history', () => {
+    const previous = {
+      domain: 'example.com',
+      updatedAt: '2026-02-01T00:00:00.000Z',
+      history: {
+        status: 'ready',
+        source: 'archiverisk',
+        cacheHit: true,
+        archiveScore: 84,
+        archiveScoreBand: 'clean',
+        archiveVerdict: 'likely_clean',
+        label: 'Real business',
+        language: 'English',
+        sensitiveWords: [],
+        riskFlags: [],
+        firstCaptureYear: 2015,
+        lastCaptureYear: 2026,
+        historyAgeMonths: 96,
+        longestStreakYears: 8,
+        distinctBuildingYears: 8,
+        recentYearsBuilt: 5,
+        capturesCount: 10,
+        yearHistogram: [{ year: 2026, count: 1 }],
+        titles: [],
+        computedAt: '2026-02-01T00:00:00.000Z',
+      },
+    };
+
+    const next = {
+      domain: 'example.com',
+      updatedAt: '2026-02-02T00:00:00.000Z',
+      history: {
+        status: 'pending',
+        source: 'archiverisk',
+        cacheHit: false,
+        archiveScore: null,
+        archiveScoreBand: 'no_data',
+        archiveVerdict: 'no_data',
+        label: 'Pending',
+        language: 'Unknown',
+        sensitiveWords: [],
+        riskFlags: [],
+        firstCaptureYear: null,
+        lastCaptureYear: null,
+        historyAgeMonths: 0,
+        longestStreakYears: 0,
+        distinctBuildingYears: 0,
+        recentYearsBuilt: 0,
+        capturesCount: 0,
+        yearHistogram: [],
+        titles: [],
+        computedAt: null,
+      },
+    };
+
+    const merged = mergeSiteReports(previous as any, next as any);
+
+    expect(merged.history?.status).toBe('ready');
+    expect(merged.history?.archiveScore).toBe(84);
+    expect(merged.history?.label).toBe('Real business');
+  });
+
   it('guards blocked crawl artifacts for API output', () => {
     const guarded = guardBlockedSiteReport({
       domain: 'example.com',

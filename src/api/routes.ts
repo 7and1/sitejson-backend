@@ -63,10 +63,11 @@ type RateLimitResult =
 
 const VALID_PROVIDERS = [
   'visual', 'meta', 'seo', 'dns', 'ads', 'publisher',
-  'files', 'authority', 'traffic', 'whois', 'radar', 'ai',
+  'files', 'authority', 'history', 'traffic', 'whois', 'radar', 'ai',
 ] as const;
 
 type ProviderName = (typeof VALID_PROVIDERS)[number];
+const OPTIONAL_PROVIDER_SUMMARY_SET = new Set<ProviderName>(['authority', 'history']);
 
 const PROVIDER_EXPECTED_FIELDS: Record<ProviderName, string[]> = {
   visual: ['screenshotUrl', 'dominantColor', 'palette', 'storage'],
@@ -77,6 +78,7 @@ const PROVIDER_EXPECTED_FIELDS: Record<ProviderName, string[]> = {
   publisher: ['hasAdsTxt', 'adSystems', 'directCount', 'resellerCount', 'monetizationSignals'],
   files: ['hasRobots', 'hasSitemap', 'robotsSitemapUrls'],
   authority: ['domainRating', 'source', 'licenseUrl', 'attribution', 'fetchedAt'],
+  history: ['status', 'archiveVerdict', 'archiveScore', 'riskFlags', 'capturesCount', 'yearHistogram', 'titles'],
   traffic: ['monthlyVisits', 'globalRank', 'countryRank', 'bounceRate', 'avgVisitDuration', 'pagesPerVisit', 'dataYear', 'dataMonth', 'isStale', 'dataAgeDays', 'snapshotDate', 'cachedAt', 'topCountry', 'topRegions', 'topKeywords', 'trafficSources'],
   whois: ['whois.registrar', 'whois.createdAt', 'whois.expiresAt', 'whois.nameservers', 'whois.status', 'domainAgeYears'],
   radar: ['globalRank', 'rankBucket', 'categories', 'sourceTimestamp'],
@@ -93,6 +95,7 @@ function extractProviderData(report: SiteReport, provider: ProviderName): Record
     case 'publisher': return report.publisher ? { ...report.publisher } : null;
     case 'files': return report.files ? { ...report.files } : null;
     case 'authority': return report.authority ? { ...report.authority } : null;
+    case 'history': return report.history ? { ...report.history } : null;
     case 'traffic': {
       if (!report.trafficData) return null;
       const { whois: _w, domainAgeYears: _d, ...traffic } = report.trafficData;
@@ -640,7 +643,7 @@ export const registerRoutes = (
         health: health ? { ok: health.ok, errorCode: health.errorCode } : null,
         completeness,
       };
-    }).filter((item) => item.provider !== 'authority' || item.hasData || item.health);
+    }).filter((item) => !OPTIONAL_PROVIDER_SUMMARY_SET.has(item.provider) || item.hasData || item.health);
 
     return reply.send({
       ok: true,

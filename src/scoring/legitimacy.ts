@@ -47,6 +47,12 @@ const countAiCorroborationSignals = (report: SiteReport): number => {
   return count;
 };
 
+const hasHistoryAbuseFlag = (riskFlags: string[]): boolean => (
+  riskFlags.includes('gambling_history')
+  || riskFlags.includes('adult_history')
+  || riskFlags.includes('pharma_spam')
+);
+
 export const calculateLegitimacyScore = (report: SiteReport): { value: number; signals: string[] } => {
   let score = 10;
   const signals: string[] = ['baseline'];
@@ -172,6 +178,43 @@ export const calculateLegitimacyScore = (report: SiteReport): { value: number; s
   if (whoisStatus?.some((s) => /(?:client|server)hold/i.test(s))) {
     score -= 10;
     signals.push('domain_held');
+  }
+
+  if (report.history?.status === 'ready' && report.history.capturesCount >= 5) {
+    if (report.history.longestStreakYears >= 5) {
+      score += 4;
+      signals.push('history_long_lived');
+    }
+
+    if (report.history.longestStreakYears >= 10) {
+      score += 3;
+      signals.push('history_very_long_lived');
+    }
+
+    if (report.history.historyAgeMonths >= 36) {
+      score += 3;
+      signals.push('history_established');
+    }
+
+    if (hasHistoryAbuseFlag(report.history.riskFlags)) {
+      score -= 12;
+      signals.push('history_prior_abuse');
+    }
+
+    if (report.history.riskFlags.includes('recent_pollution')) {
+      score -= 8;
+      signals.push('history_recent_pollution');
+    }
+
+    if (report.history.riskFlags.includes('parking_only')) {
+      score -= 5;
+      signals.push('history_parking_only');
+    }
+
+    if (report.history.riskFlags.includes('theme_drift')) {
+      score -= 3;
+      signals.push('history_theme_drift');
+    }
   }
 
   const aiCorroborationSignals = countAiCorroborationSignals(report);

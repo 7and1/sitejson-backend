@@ -808,6 +808,174 @@
           }
         }
       },
+      "HistoryYearBucket": {
+        "type": "object",
+        "properties": {
+          "year": {
+            "type": "integer"
+          },
+          "count": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "year",
+          "count"
+        ]
+      },
+      "HistoryTitleSample": {
+        "type": "object",
+        "properties": {
+          "year": {
+            "type": "integer"
+          },
+          "timestamp": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "archiveUrl": {
+            "type": "string",
+            "format": "uri"
+          }
+        },
+        "required": [
+          "year",
+          "timestamp",
+          "title",
+          "archiveUrl"
+        ]
+      },
+      "HistoryReport": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ready",
+              "pending",
+              "failed",
+              "miss"
+            ]
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "archiverisk"
+            ]
+          },
+          "cacheHit": {
+            "type": "boolean"
+          },
+          "archiveScore": {
+            "type": "number",
+            "nullable": true,
+            "minimum": 0,
+            "maximum": 100
+          },
+          "archiveScoreBand": {
+            "type": "string",
+            "enum": [
+              "clean",
+              "watch",
+              "review",
+              "reject",
+              "no_data"
+            ]
+          },
+          "archiveVerdict": {
+            "type": "string",
+            "enum": [
+              "reject",
+              "review",
+              "watch",
+              "likely_clean",
+              "no_data"
+            ]
+          },
+          "label": {
+            "type": "string"
+          },
+          "language": {
+            "type": "string"
+          },
+          "sensitiveWords": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "riskFlags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "firstCaptureYear": {
+            "type": "integer",
+            "nullable": true
+          },
+          "lastCaptureYear": {
+            "type": "integer",
+            "nullable": true
+          },
+          "historyAgeMonths": {
+            "type": "integer"
+          },
+          "longestStreakYears": {
+            "type": "integer"
+          },
+          "distinctBuildingYears": {
+            "type": "integer"
+          },
+          "recentYearsBuilt": {
+            "type": "integer"
+          },
+          "capturesCount": {
+            "type": "integer"
+          },
+          "yearHistogram": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HistoryYearBucket"
+            }
+          },
+          "titles": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HistoryTitleSample"
+            }
+          },
+          "computedAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          }
+        },
+        "required": [
+          "status",
+          "source",
+          "cacheHit",
+          "archiveScore",
+          "archiveScoreBand",
+          "archiveVerdict",
+          "label",
+          "language",
+          "sensitiveWords",
+          "riskFlags",
+          "firstCaptureYear",
+          "lastCaptureYear",
+          "historyAgeMonths",
+          "longestStreakYears",
+          "distinctBuildingYears",
+          "recentYearsBuilt",
+          "capturesCount",
+          "yearHistogram",
+          "titles",
+          "computedAt"
+        ]
+      },
       "TrafficRegion": {
         "type": "object",
         "properties": {
@@ -1388,6 +1556,9 @@
           },
           "authority": {
             "$ref": "#/components/schemas/AuthorityReport"
+          },
+          "history": {
+            "$ref": "#/components/schemas/HistoryReport"
           },
           "trafficData": {
             "$ref": "#/components/schemas/TrafficReport"
@@ -2739,6 +2910,7 @@
                 "publisher",
                 "files",
                 "authority",
+                "history",
                 "traffic",
                 "whois",
                 "radar",

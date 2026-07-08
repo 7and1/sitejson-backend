@@ -23,15 +23,24 @@ Computes a 0-100 bounded score from binary signal checks. Each signal adds or su
 | `domain_age_1y` | +5 | Domain age >= 1 year | WhoisProvider |
 | `domain_expires_soon` | -5 | Domain expires within 30 days | WhoisProvider |
 | `domain_held` | -10 | Status contains clientHold or serverHold | WhoisProvider |
+| `history_long_lived` | +4 | Longest archive streak >= 5 years | ArchiveHistoryProvider |
+| `history_very_long_lived` | +3 | Longest archive streak >= 10 years (stacks with `history_long_lived`) | ArchiveHistoryProvider |
+| `history_established` | +3 | Archive history age >= 36 months | ArchiveHistoryProvider |
+| `history_prior_abuse` | -12 | riskFlags include `gambling_history` / `adult_history` / `pharma_spam` | ArchiveHistoryProvider |
+| `history_recent_pollution` | -8 | riskFlags include `recent_pollution` | ArchiveHistoryProvider |
+| `history_parking_only` | -5 | riskFlags include `parking_only` | ArchiveHistoryProvider |
+| `history_theme_drift` | -3 | riskFlags include `theme_drift` | ArchiveHistoryProvider |
 | `ai_professional` | +15 | AI sentiment = "Professional" | AiProvider |
 | `spam_signal` | -30 | AI isSpam = true | AiProvider |
+
+History signals only apply when `report.history.status === 'ready'` and `report.history.capturesCount >= 5`; they require the feature-flagged ArchiveHistoryProvider (`ARCHIVE_HISTORY_ENABLED=true`).
 
 ## Score Bounds
 
 - Theoretical max: 100 (clamped)
 - Theoretical min: 0 (clamped)
-- Max positive sum: 10+10+5+5+5+5+5+5+5+10+5+5+5+15 = 95
-- Max negative sum: -5-10-30 = -45
+- Max positive sum: 10 + 10 + 5 + 5 + 5 + 5 + 5 + 5 + 5 + 10 + 5 + 5 + 5 + 4 + 3 + 3 + 15 = 105 (clamped to 100)
+- Max negative sum: -5-10-12-8-5-3-30 = -73
 
 ## Data Flow
 
@@ -45,6 +54,7 @@ SiteReport
   ├── trafficData.domainAgeYears       → domain_age_1y
   ├── trafficData.whois.expiresAt      → domain_expires_soon
   ├── trafficData.whois.status         → domain_held
+  ├── history.longestStreakYears / historyAgeMonths / riskFlags → history_*
   └── aiAnalysis.risk.sentiment/isSpam → ai_professional, spam_signal
 ```
 
@@ -57,3 +67,4 @@ File: `src/scoring/__tests__/legitimacy.spec.ts`
 - Domain expiry penalty
 - Domain hold penalty
 - No false positives on healthy domains
+- History signals: long-lived/established boosts, abuse/pollution penalties, `ready` + `capturesCount >= 5` gating

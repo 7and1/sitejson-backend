@@ -1,13 +1,13 @@
 # Provider Data Reference
 
-12 providers, 5 worker phases. Each provider implements `Provider<T>` and returns a `ProviderResult<T>`.
+13 providers, 5 worker phases. Each provider implements `Provider<T>` and returns a `ProviderResult<T>`.
 
 ## Provider → Phase Mapping
 
 | Phase | Queue | Providers |
 |-------|-------|-----------|
 | browser | `browser` | Visual, Meta, Seo, Ai |
-| async | `async` | Dns, Ads, Publisher, Files, Authority (optional) |
+| async | `async` | Dns, Ads, Publisher, Files, Authority (optional), History (optional) |
 | traffic | `traffic` | Traffic |
 | whois | `whois` | Whois |
 | radar | `radar` | Radar |
@@ -188,6 +188,34 @@ File: `src/providers/ai.provider.ts`
 | visualAnalysis? | object | Anthropic vision path only: `{ designStyle, uiScore, vibe, logoText? }` |
 
 3 backend support: Gemini, OpenAI, Anthropic. Visual analysis only via Anthropic vision.
+
+### 13. ArchiveHistoryProvider
+
+File: `src/providers/history.provider.ts`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| status | `'ready' \| 'pending' \| 'failed'` | ArchiveRisk computation state (`miss` is returned internally but never merged into the report) |
+| source | `'archiverisk'` | Upstream source identifier |
+| cacheHit | boolean | Whether the payload came from the ArchiveRisk cache |
+| archiveScore | number \| null | ArchiveRisk history score, 0-100 |
+| archiveScoreBand | `'clean' \| 'watch' \| 'review' \| 'reject' \| 'no_data'` | Score band |
+| archiveVerdict | `'reject' \| 'review' \| 'watch' \| 'likely_clean' \| 'no_data'` | Verdict |
+| label | string | Human-readable summary label |
+| language | string | Dominant language of archived titles |
+| sensitiveWords | string[] | Sensitive terms found in archived titles |
+| riskFlags | string[] | `gambling_history`, `adult_history`, `pharma_spam`, `recent_pollution`, `parking_only`, `theme_drift` |
+| firstCaptureYear / lastCaptureYear | number \| null | Wayback capture year bounds |
+| historyAgeMonths | number | Span between first and last capture |
+| longestStreakYears | number | Longest consecutive-year capture streak |
+| distinctBuildingYears | number | Years with active site building |
+| recentYearsBuilt | number | Recent years with building activity |
+| capturesCount | number | Captures analyzed |
+| yearHistogram | array | `[{ year, count }]` capture histogram |
+| titles | array | `[{ year, timestamp, title, archiveUrl }]`, capped at `ARCHIVE_HISTORY_MAX_TITLES` (default 12) |
+| computedAt | string \| null | When ArchiveRisk computed the history |
+
+Feature-flagged by `ARCHIVE_HISTORY_ENABLED=true` and defaults to disabled. Runs in the async phase, so in prod the `sitejson-worker-io` container must be attached to `proxy-tier` (`nginx-proxy_default`) to reach `ARCHIVE_HISTORY_BASE_URL` (`http://archiverisk-web:3000`). `GET /api/lookup/:domain` reads the ArchiveRisk cache; a cache miss is a silent success (`status='miss'`) that is never written to `report.history`. With `ARCHIVE_HISTORY_COMPUTE_ON_MISS=true` plus `ARCHIVE_HISTORY_API_KEY`, a miss triggers `POST /api/lookup/:domain/compute` (API-key callers bypass Turnstile/grant but still count against the ArchiveRisk compute rate limit). No provider-level TTL: each async run re-reads the cache; `mergeSiteReports` keeps an existing `ready` history over later `pending`/`failed`/`miss` payloads. Failure codes: `ARCHIVE_HISTORY_DISABLED`, `ARCHIVE_HISTORY_BAD_REQUEST`, `ARCHIVE_HISTORY_ACCESS_RESTRICTED`, `ARCHIVE_HISTORY_RATE_LIMITED`, `ARCHIVE_HISTORY_UPSTREAM_ERROR`, `ARCHIVE_HISTORY_TIMEOUT`, `ARCHIVE_HISTORY_INVALID_RESPONSE`, `ARCHIVE_HISTORY_FETCH_FAILED`.
 
 ## Worker Cooldown / TTL
 

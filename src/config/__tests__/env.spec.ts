@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { loadEnv } from '../env.js';
 
 const ORIGINAL_ENV = { ...process.env };
-const STRONG_API_KEY = 'sj_live_A7x9Qp2Lm8R4tY6uI0oP3zX5cV1bN9mK';
+const STRONG_API_KEY = 'sj_live_A7x9Qp2Lm8R4_tY6uI0oP3zX5cV1bN9mK';
 const STRONG_OPS_KEY = 'sj_ops_Z4pL8nQ2vR7sT1xC6mB9yH3kD5wF0aJ';
 const STRONG_PREVIOUS_API_KEY = 'sj_prev_B8qN3vT6mX1cZ9pL4rS7kD2hW5yF0uE';
 const STRONG_PREVIOUS_OPS_KEY = 'sj_ops_prev_C5rT9xM2pL7vN4qB8zK1hD6wY3sF0eA';
@@ -45,7 +45,7 @@ describe('loadEnv', () => {
 
   it('rejects low-entropy production api keys', () => {
     process.env.NODE_ENV = 'production';
-    process.env.SITEJSON_API_KEY = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    process.env.SITEJSON_API_KEY = 'aaaaaaaaaaaaaaaa_aaaaaaaaaaaaaaaaaaaaaaa';
     process.env.SITEJSON_OPS_API_KEY = STRONG_OPS_KEY;
     process.env.CORS_ALLOWLIST = PRODUCTION_CORS_ALLOWLIST;
 
@@ -157,6 +157,12 @@ describe('loadEnv', () => {
     expect(env.AHREFS_DR_ENABLED).toBe(false);
     expect(env.AHREFS_DR_ENDPOINT).toBe('https://api.ahrefs.com/v3/public/domain-rating-free');
     expect(env.AHREFS_DR_CACHE_TTL_HOURS).toBe(720);
+    expect(env.ARCHIVE_HISTORY_ENABLED).toBe(false);
+    expect(env.ARCHIVE_HISTORY_BASE_URL).toBeUndefined();
+    expect(env.ARCHIVE_HISTORY_API_KEY).toBeUndefined();
+    expect(env.ARCHIVE_HISTORY_COMPUTE_ON_MISS).toBe(false);
+    expect(env.ARCHIVE_HISTORY_MAX_TITLES).toBe(12);
+    expect(env.ARCHIVE_HISTORY_TIMEOUT_MS).toBe(4000);
     expect(env.PG_POOL_MAX_API).toBeUndefined();
     expect(env.PG_POOL_MAX_WORKER).toBeUndefined();
     expect(env.DIRECTORY_CACHE_PREWARM_TOP_SLUGS).toBe(25);
@@ -180,6 +186,24 @@ describe('loadEnv', () => {
     expect(env.AHREFS_DR_ENABLED).toBe(true);
     expect(env.AHREFS_DR_ENDPOINT).toBe('https://api.example.test/domain-rating');
     expect(env.AHREFS_DR_CACHE_TTL_HOURS).toBe(168);
+  });
+
+  it('parses the ArchiveRisk history provider settings', () => {
+    process.env.ARCHIVE_HISTORY_ENABLED = 'true';
+    process.env.ARCHIVE_HISTORY_BASE_URL = 'http://archiverisk-web:3000';
+    process.env.ARCHIVE_HISTORY_API_KEY = '  archive-history-key  ';
+    process.env.ARCHIVE_HISTORY_COMPUTE_ON_MISS = 'true';
+    process.env.ARCHIVE_HISTORY_MAX_TITLES = '20';
+    process.env.ARCHIVE_HISTORY_TIMEOUT_MS = '2500';
+
+    const env = loadEnv();
+
+    expect(env.ARCHIVE_HISTORY_ENABLED).toBe(true);
+    expect(env.ARCHIVE_HISTORY_BASE_URL).toBe('http://archiverisk-web:3000');
+    expect(env.ARCHIVE_HISTORY_API_KEY).toBe('archive-history-key');
+    expect(env.ARCHIVE_HISTORY_COMPUTE_ON_MISS).toBe(true);
+    expect(env.ARCHIVE_HISTORY_MAX_TITLES).toBe(20);
+    expect(env.ARCHIVE_HISTORY_TIMEOUT_MS).toBe(2500);
   });
 
   it('parses optional tier-specific analyze and ingest rate limits', () => {

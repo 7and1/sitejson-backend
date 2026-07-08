@@ -9,6 +9,7 @@ import {
   parseAiData,
   parseDnsData,
   parseFilesData,
+  parseHistoryData,
   parseMetaData,
   parsePublisherData,
   parseRadarData,
@@ -132,6 +133,7 @@ const ASYNC_PROVIDER_SET = new Set([
   'dns.provider',
   'ads.provider',
   'authority.provider',
+  'history.provider',
   'publisher.provider',
   'files.provider',
   'ai.provider',
@@ -1024,6 +1026,13 @@ export class Orchestrator {
               attribution: authority.attribution,
               fetchedAt: authority.fetchedAt,
             };
+          }
+          break;
+        }
+        case 'history.provider': {
+          const history = parseHistoryData(result.data);
+          if (history && history.status !== 'miss') {
+            report.history = history;
           }
           break;
         }
