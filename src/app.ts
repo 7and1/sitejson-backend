@@ -30,7 +30,7 @@ import {
 import { AnalyzeService } from './services/analyze-service.js';
 import { IngestService } from './services/ingest-service.js';
 import { OpsDashboardService } from './services/ops-dashboard-service.js';
-import { Orchestrator } from './core/orchestrator.js';
+import { Orchestrator, deriveHistoryTimeoutMs } from './core/orchestrator.js';
 import { TrafficHistoryService } from './services/traffic-history-service.js';
 import {
   AdsProvider,
@@ -524,8 +524,7 @@ export const buildApp = async (
       timeoutMs: env.PROVIDER_TIMEOUT_MS,
       providerQuickTimeoutMs: env.PROVIDER_TIMEOUT_MS_FAST,
       aiTimeoutMs: env.AI_TIMEOUT_MS,
-      // worst case is a sequential lookup + compute round-trip
-      historyTimeoutMs: env.ARCHIVE_HISTORY_TIMEOUT_MS * 2 + 2000,
+      historyTimeoutMs: deriveHistoryTimeoutMs(env.ARCHIVE_HISTORY_TIMEOUT_MS),
       retryAttempts: env.PROVIDER_RETRY_ATTEMPTS,
       retryBaseMs: env.PROVIDER_RETRY_BASE_MS,
       userAgent: env.USER_AGENT,

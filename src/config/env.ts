@@ -154,6 +154,7 @@ const envSchema = z.object({
   SITE_REPORT_TTL_SEC: z.coerce.number().int().positive().default(604800),
   PROVIDER_TIMEOUT_MS: z.coerce.number().int().positive().default(15000),
   PROVIDER_TIMEOUT_MS_FAST: z.coerce.number().int().positive().default(5000),
+  WORKER_SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().positive().default(60000),
   PROVIDER_RETRY_ATTEMPTS: z.coerce.number().int().min(0).default(2),
   PROVIDER_RETRY_BASE_MS: z.coerce.number().int().positive().default(250),
   ANALYZE_RATE_LIMIT_PER_MIN: z.coerce.number().int().positive().default(60),

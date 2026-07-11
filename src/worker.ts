@@ -13,7 +13,6 @@ import type { QueueName } from './queue/names.js';
 import { ALL_QUEUE_NAMES, QUEUE_NAMES } from './queue/names.js';
 import type { Logger } from './observability/logger.js';
 
-const SHUTDOWN_TIMEOUT_MS = 60_000;
 const HEARTBEAT_INTERVAL_MS = 10_000;
 
 const parseWorkerQueues = (raw?: string): Set<QueueName> | null => {
@@ -243,10 +242,13 @@ const startWorker = async () => {
     isShuttingDown = true;
     runtime.logger.info({ module: 'worker', event: 'shutdown_started', signal });
 
+    // must exceed the longest provider deadline this worker can run (history
+    // compute-on-miss: 122s on worker-io), and stay below stop_grace_period
+    const shutdownTimeoutMs = runtime.env.WORKER_SHUTDOWN_TIMEOUT_MS;
     const forceExitTimer = setTimeout(() => {
-      runtime.logger.error({ module: 'worker', event: 'shutdown_timeout', timeout_ms: SHUTDOWN_TIMEOUT_MS });
+      runtime.logger.error({ module: 'worker', event: 'shutdown_timeout', timeout_ms: shutdownTimeoutMs });
       process.exit(1);
-    }, SHUTDOWN_TIMEOUT_MS);
+    }, shutdownTimeoutMs);
     forceExitTimer.unref(); // Don't keep process alive just for the timer
 
     try {

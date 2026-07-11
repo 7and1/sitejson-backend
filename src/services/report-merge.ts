@@ -240,6 +240,14 @@ const mergeHistory = (
   if (previous.status === 'ready' && (next.status === 'pending' || next.status === 'failed')) {
     return previous;
   }
+  // CDX outages make ArchiveRisk cache degraded ready rows (scoreBand no_data,
+  // score NULL, 0 captures); never let one clobber a good ready snapshot
+  if (
+    previous.status === 'ready' && previous.archiveScoreBand !== 'no_data'
+    && next.status === 'ready' && next.archiveScoreBand === 'no_data'
+  ) {
+    return previous;
+  }
   return next;
 };
 

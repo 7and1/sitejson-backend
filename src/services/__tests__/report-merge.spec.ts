@@ -300,6 +300,105 @@ describe('mergeSiteReports', () => {
     expect(merged.history?.label).toBe('Real business');
   });
 
+  it('keeps a good ready history when a CDX-flake degraded ready/no_data row arrives', () => {
+    const goodHistory = {
+      status: 'ready',
+      source: 'archiverisk',
+      cacheHit: true,
+      archiveScore: 84,
+      archiveScoreBand: 'clean',
+      archiveVerdict: 'likely_clean',
+      label: 'Real business',
+      language: 'English',
+      sensitiveWords: [],
+      riskFlags: [],
+      firstCaptureYear: 2015,
+      lastCaptureYear: 2026,
+      historyAgeMonths: 96,
+      longestStreakYears: 8,
+      distinctBuildingYears: 8,
+      recentYearsBuilt: 5,
+      capturesCount: 500,
+      yearHistogram: [{ year: 2026, count: 1 }],
+      titles: [],
+      computedAt: '2026-02-01T00:00:00.000Z',
+    };
+    const degradedHistory = {
+      status: 'ready',
+      source: 'archiverisk',
+      cacheHit: true,
+      archiveScore: null,
+      archiveScoreBand: 'no_data',
+      archiveVerdict: 'no_data',
+      label: 'No data',
+      language: 'Unknown',
+      sensitiveWords: [],
+      riskFlags: [],
+      firstCaptureYear: null,
+      lastCaptureYear: null,
+      historyAgeMonths: 0,
+      longestStreakYears: 0,
+      distinctBuildingYears: 0,
+      recentYearsBuilt: 0,
+      capturesCount: 0,
+      yearHistogram: [],
+      titles: [],
+      computedAt: '2026-02-02T00:00:00.000Z',
+    };
+
+    const merged = mergeSiteReports(
+      { domain: 'example.com', updatedAt: '2026-02-01T00:00:00.000Z', history: goodHistory } as any,
+      { domain: 'example.com', updatedAt: '2026-02-02T00:00:00.000Z', history: degradedHistory } as any,
+    );
+
+    expect(merged.history?.archiveScoreBand).toBe('clean');
+    expect(merged.history?.archiveScore).toBe(84);
+    expect(merged.history?.capturesCount).toBe(500);
+  });
+
+  it('lets a recovered good ready history replace a previously degraded no_data row', () => {
+    const degradedHistory = {
+      status: 'ready',
+      source: 'archiverisk',
+      cacheHit: true,
+      archiveScore: null,
+      archiveScoreBand: 'no_data',
+      archiveVerdict: 'no_data',
+      label: 'No data',
+      language: 'Unknown',
+      sensitiveWords: [],
+      riskFlags: [],
+      firstCaptureYear: null,
+      lastCaptureYear: null,
+      historyAgeMonths: 0,
+      longestStreakYears: 0,
+      distinctBuildingYears: 0,
+      recentYearsBuilt: 0,
+      capturesCount: 0,
+      yearHistogram: [],
+      titles: [],
+      computedAt: '2026-02-01T00:00:00.000Z',
+    };
+    const recoveredHistory = {
+      ...degradedHistory,
+      archiveScore: 76,
+      archiveScoreBand: 'watch',
+      archiveVerdict: 'watch',
+      label: 'Real business',
+      capturesCount: 2000,
+      computedAt: '2026-02-02T00:00:00.000Z',
+    };
+
+    const merged = mergeSiteReports(
+      { domain: 'example.com', updatedAt: '2026-02-01T00:00:00.000Z', history: degradedHistory } as any,
+      { domain: 'example.com', updatedAt: '2026-02-02T00:00:00.000Z', history: recoveredHistory } as any,
+    );
+
+    expect(merged.history?.archiveScoreBand).toBe('watch');
+    expect(merged.history?.archiveScore).toBe(76);
+    expect(merged.history?.capturesCount).toBe(2000);
+  });
+
   it('guards blocked crawl artifacts for API output', () => {
     const guarded = guardBlockedSiteReport({
       domain: 'example.com',

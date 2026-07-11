@@ -1,6 +1,6 @@
 import { promises as dns } from 'node:dns';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { Orchestrator, buildPinnedHostResolverRules, shouldAllowBrowserRequestUrl, resolveProviderDeadlineMs } from '../orchestrator.js';
+import { Orchestrator, buildPinnedHostResolverRules, shouldAllowBrowserRequestUrl, resolveProviderDeadlineMs, deriveHistoryTimeoutMs } from '../orchestrator.js';
 import { createLogger } from '../../observability/logger.js';
 import {
   AdsProvider,
@@ -88,6 +88,16 @@ describe('resolveProviderDeadlineMs', () => {
     expect(resolveProviderDeadlineMs('history.provider', runtimeOptions)).toBe(100);
     expect(resolveProviderDeadlineMs('history.provider', { ...runtimeOptions, historyTimeoutMs: 400 })).toBe(400);
     expect(resolveProviderDeadlineMs('history.provider', { ...runtimeOptions, historyTimeoutMs: 50 })).toBe(100);
+  });
+
+  it('derives the history deadline from the inner fetch timeout (lookup + compute round-trip)', () => {
+    // production regression pin: 60s inner timeout must yield the 122s deadline
+    expect(deriveHistoryTimeoutMs(60000)).toBe(122000);
+    // default inner timeout stays below the 15s global provider deadline
+    expect(deriveHistoryTimeoutMs(4000)).toBe(10000);
+    expect(
+      resolveProviderDeadlineMs('history.provider', { ...runtimeOptions, historyTimeoutMs: deriveHistoryTimeoutMs(60000) }),
+    ).toBe(122000);
   });
 });
 

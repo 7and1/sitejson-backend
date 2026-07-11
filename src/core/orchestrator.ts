@@ -93,6 +93,11 @@ const QUICK_DEADLINE_PROVIDERS = new Set([
   'publisher.provider',
 ]);
 
+// worst case for the history provider is a sequential lookup + compute
+// round-trip against ArchiveRisk, each bounded by the inner fetch timeout
+export const deriveHistoryTimeoutMs = (archiveHistoryTimeoutMs: number): number =>
+  archiveHistoryTimeoutMs * 2 + 2000;
+
 export const resolveProviderDeadlineMs = (
   providerName: string,
   runtimeOptions: Pick<RuntimeOptions, 'timeoutMs' | 'providerQuickTimeoutMs' | 'aiTimeoutMs' | 'historyTimeoutMs'>,
