@@ -175,6 +175,15 @@ const startWorker = async () => {
       runtime.env.TRAFFIC_NO_DATA_MAX_COOLDOWN_HOURS,
       runtime.env.TRAFFIC_FASTLANE_BATCH_SIZE,
       runtime.env.TRAFFIC_FASTLANE_MAX_SNAPSHOT_AGE_DAYS,
+      runtime.env.TRAFFIC_MONTHLY_SEED_ENABLED,
+      {
+        enabled: runtime.env.TRAFFIC_SIMILARWEB_SEED_ENABLED,
+        baseUrl: runtime.env.TRAFFIC_SIMILARWEB_BASE_URL,
+        apiKey: runtime.env.TRAFFIC_SIMILARWEB_API_KEY,
+        batchSize: runtime.env.TRAFFIC_SIMILARWEB_SEED_BATCH_SIZE,
+        maxSnapshotAgeDays: runtime.env.TRAFFIC_FASTLANE_MAX_SNAPSHOT_AGE_DAYS,
+        timeoutMs: runtime.env.TRAFFIC_SIMILARWEB_TIMEOUT_MS,
+      },
     );
     startPromises.push(trafficWorker.start());
   }
@@ -222,8 +231,11 @@ const startWorker = async () => {
   if (shouldRun('ingest')) {
     await setupScheduledJobs(runtime.dependencies.queue, runtime.logger, {
       TRAFFIC_REFRESH_START_DAY: runtime.env.TRAFFIC_REFRESH_START_DAY,
+      TRAFFIC_MONTHLY_SEED_ENABLED: runtime.env.TRAFFIC_MONTHLY_SEED_ENABLED,
       TRAFFIC_FASTLANE_ENABLED: runtime.env.TRAFFIC_FASTLANE_ENABLED,
       TRAFFIC_FASTLANE_CRON: runtime.env.TRAFFIC_FASTLANE_CRON,
+      TRAFFIC_SIMILARWEB_SEED_ENABLED: runtime.env.TRAFFIC_SIMILARWEB_SEED_ENABLED,
+      TRAFFIC_SIMILARWEB_SEED_CRON: runtime.env.TRAFFIC_SIMILARWEB_SEED_CRON,
       INGEST_AUTO_FEED_ENABLED: runtime.env.INGEST_AUTO_FEED_ENABLED,
       INGEST_AUTO_FEED_CRON: runtime.env.INGEST_AUTO_FEED_CRON,
       AI_RETRY_FEED_ENABLED: runtime.env.AI_RETRY_FEED_ENABLED,

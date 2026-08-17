@@ -2448,6 +2448,32 @@ export class PostgresCrawlTargetRepository implements CrawlTargetRepository {
     return result.rows.map((row) => row.domain);
   }
 
+  async getSimilarwebCollectSeedDomains(
+    limit: number,
+    options?: { maxSnapshotAgeDays?: number },
+  ): Promise<Array<{ domain: string; radarRank?: number }>> {
+    const safeLimit = Math.max(1, Math.min(50, Math.trunc(limit)));
+    const maxSnapshotAgeDays = Math.max(1, Math.trunc(options?.maxSnapshotAgeDays ?? 30));
+    const result = await this.pool.query<{ domain: string; radar_rank: number | null }>(
+      `SELECT ct.domain, ct.radar_rank
+       FROM crawl_targets ct
+       INNER JOIN site_profiles sp ON sp.domain = ct.domain
+       WHERE (ct.next_traffic_at IS NULL OR ct.next_traffic_at <= NOW())
+         AND (
+           ct.last_traffic_at IS NULL
+           OR ct.last_traffic_at <= NOW() - (($2::text || ' days')::interval)
+         )
+       ORDER BY ct.radar_rank ASC NULLS LAST, ct.priority DESC, ct.updated_at ASC
+       LIMIT $1`,
+      [safeLimit, maxSnapshotAgeDays],
+    );
+
+    return result.rows.map((row) => ({
+      domain: row.domain,
+      radarRank: row.radar_rank ?? undefined,
+    }));
+  }
+
   async getHighRankFirstRunDomains(
     limit: number,
     options?: { maxRadarRank?: number },

@@ -1007,6 +1007,36 @@ export class InMemoryCrawlTargetRepository implements CrawlTargetRepository {
       .map((target) => target.domain);
   }
 
+  async getSimilarwebCollectSeedDomains(
+    limit: number,
+    options?: { maxSnapshotAgeDays?: number },
+  ): Promise<Array<{ domain: string; radarRank?: number }>> {
+    const safeLimit = Math.max(1, Math.min(50, Math.trunc(limit)));
+    const maxSnapshotAgeDays = Math.max(1, Math.trunc(options?.maxSnapshotAgeDays ?? 30));
+    const maxAgeMs = maxSnapshotAgeDays * 86_400_000;
+    const nowMs = Date.now();
+
+    return Array.from(this.targets.values())
+      .filter((target) => isDue(target.nextTrafficAt))
+      .filter((target) => {
+        if (!target.lastTrafficAt) {
+          return true;
+        }
+        const lastTrafficAtMs = new Date(target.lastTrafficAt).getTime();
+        return !Number.isFinite(lastTrafficAtMs) || (nowMs - lastTrafficAtMs) >= maxAgeMs;
+      })
+      .sort((left, right) => {
+        const leftRank = left.radarRank ?? Number.POSITIVE_INFINITY;
+        const rightRank = right.radarRank ?? Number.POSITIVE_INFINITY;
+        if (leftRank !== rightRank) {
+          return leftRank - rightRank;
+        }
+        return right.priority - left.priority;
+      })
+      .slice(0, safeLimit)
+      .map((target) => ({ domain: target.domain, radarRank: target.radarRank }));
+  }
+
   async getHighRankFirstRunDomains(
     limit: number,
     options?: { maxRadarRank?: number },

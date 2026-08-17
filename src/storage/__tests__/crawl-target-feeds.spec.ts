@@ -207,4 +207,26 @@ describe('CrawlTarget feed selectors', () => {
       lastBrowserStatus: 'success',
     });
   });
+
+  it('seeds SimilarWeb by ascending Radar rank and caps each batch at 50', async () => {
+    const repo = new InMemoryCrawlTargetRepository();
+    const targets = Array.from({ length: 55 }, (_, index) => {
+      const radarRank = 55 - index;
+      return {
+        domain: `rank-${String(radarRank).padStart(2, '0')}.example`,
+        radarRank,
+        priority: 1,
+        isHighValue: radarRank <= 10,
+      };
+    });
+    await repo.bulkUpsert(targets);
+
+    const selected = await repo.getSimilarwebCollectSeedDomains(80, {
+      maxSnapshotAgeDays: 30,
+    });
+
+    expect(selected).toHaveLength(50);
+    expect(selected[0]).toEqual({ domain: 'rank-01.example', radarRank: 1 });
+    expect(selected[49]).toEqual({ domain: 'rank-50.example', radarRank: 50 });
+  });
 });

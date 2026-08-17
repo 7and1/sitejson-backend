@@ -1,4 +1,13 @@
 import { describe, expect, it, vi } from 'vitest';
+
+const { fetchWithRetry } = vi.hoisted(() => ({
+  fetchWithRetry: vi.fn(),
+}));
+
+vi.mock('../../providers/http.js', () => ({
+  fetchWithRetry,
+}));
+
 import { TrafficWorker } from '../traffic-worker.js';
 
 const noopLogger = {
@@ -237,6 +246,12 @@ describe('TrafficWorker', () => {
       orchestrator as any,
       noopLogger as any,
       2,
+      24 * 30,
+      24 * 7,
+      24 * 30,
+      800,
+      30,
+      true,
     );
 
     await worker.process({
@@ -307,6 +322,12 @@ describe('TrafficWorker', () => {
       orchestrator as any,
       logger as any,
       2,
+      24 * 30,
+      24 * 7,
+      24 * 30,
+      800,
+      30,
+      true,
     );
 
     await worker.process({
@@ -324,5 +345,129 @@ describe('TrafficWorker', () => {
       redis_memory_ratio: 0.9,
       hard_stop_ratio: 0.85,
     }));
+  });
+
+  it('ignores a legacy monthly repeatable when monthly seeding is disabled', async () => {
+    const queue = {
+      enqueueBulk: vi.fn(),
+    };
+    const crawlTargets = {
+      getTopByRadarRank: vi.fn(),
+    };
+    const worker = new TrafficWorker(
+      queue as any,
+      {} as any,
+      crawlTargets as any,
+      {} as any,
+      {} as any,
+      noopLogger as any,
+      30,
+      24 * 30,
+      24 * 7,
+      24 * 30,
+      10,
+      30,
+      false,
+    );
+
+    await worker.process({
+      jobId: 'legacy-monthly-repeatable',
+      domain: '',
+      traceId: 'trc-monthly-disabled',
+      phase: 'traffic',
+      purpose: 'traffic-monthly-seed',
+    });
+
+    expect(crawlTargets.getTopByRadarRank).not.toHaveBeenCalled();
+    expect(queue.enqueueBulk).not.toHaveBeenCalled();
+  });
+
+  it('seeds SimilarWeb in Radar-rank order and caps one request at 50 domains', async () => {
+    const queue = {
+      enqueue: vi.fn(),
+      enqueueBulk: vi.fn(),
+      addRepeatable: vi.fn(),
+      consume: vi.fn(),
+      getCounts: vi.fn(),
+      getAllCounts: vi.fn(),
+      retryFailed: vi.fn(),
+      healthCheck: vi.fn(),
+    };
+    const sites = {
+      getByDomain: vi.fn(),
+      upsert: vi.fn(),
+    };
+    const ranked = Array.from({ length: 50 }, (_, index) => ({
+      domain: `rank-${String(index + 1).padStart(2, '0')}.example`,
+      radarRank: index + 1,
+    }));
+    const crawlTargets = {
+      getByDomain: vi.fn(),
+      update: vi.fn(),
+      getSimilarwebCollectSeedDomains: vi.fn().mockResolvedValue(ranked),
+    };
+    const jobs = {
+      markRunning: vi.fn(),
+      markFailed: vi.fn(),
+    };
+    const orchestrator = {
+      analyze: vi.fn(),
+    };
+    fetchWithRetry.mockResolvedValueOnce({ status: 202 });
+
+    const worker = new TrafficWorker(
+      queue as any,
+      sites as any,
+      crawlTargets as any,
+      jobs as any,
+      orchestrator as any,
+      noopLogger as any,
+      30,
+      24 * 30,
+      24 * 7,
+      24 * 30,
+      10,
+      30,
+      false,
+      {
+        enabled: true,
+        baseUrl: 'http://sitejson-similarweb-api:3000/',
+        apiKey: 'internal-test-key',
+        batchSize: 80,
+        maxSnapshotAgeDays: 30,
+        timeoutMs: 12000,
+      },
+    );
+
+    await worker.process({
+      jobId: 'traffic-similarweb-collect-seed',
+      domain: '',
+      traceId: 'trc-sw-seed',
+      phase: 'traffic',
+      purpose: 'traffic-similarweb-collect-seed',
+    });
+
+    expect(crawlTargets.getSimilarwebCollectSeedDomains).toHaveBeenCalledWith(50, {
+      maxSnapshotAgeDays: 30,
+    });
+    expect(fetchWithRetry).toHaveBeenCalledTimes(1);
+    const [url, options] = fetchWithRetry.mock.calls[0];
+    expect(url).toBe('http://sitejson-similarweb-api:3000/api/v1/collect');
+    expect(options.requestInit.headers['x-api-key']).toBe('internal-test-key');
+    const body = JSON.parse(options.requestInit.body as string);
+    expect(body.priority).toBe('low');
+    expect(body.domains).toHaveLength(50);
+    expect(body.domains[0]).toBe('rank-01.example');
+    expect(body.domains[49]).toBe('rank-50.example');
+    expect(queue.enqueueBulk).toHaveBeenCalledTimes(1);
+    const [followups, queueName] = queue.enqueueBulk.mock.calls[0];
+    expect(queueName).toBe('traffic');
+    expect(followups).toHaveLength(50);
+    expect(followups[0]).toMatchObject({
+      jobId: 'traffic-similarweb-followup-rank-01.example',
+      domain: 'rank-01.example',
+      purpose: 'traffic-refresh',
+      delayMs: 15 * 60 * 1000,
+    });
   });
 });

@@ -4,8 +4,11 @@ import type { Logger } from '../observability/logger.js';
 
 type SchedulerEnv = {
   TRAFFIC_REFRESH_START_DAY: number;
+  TRAFFIC_MONTHLY_SEED_ENABLED?: boolean;
   TRAFFIC_FASTLANE_ENABLED?: boolean;
   TRAFFIC_FASTLANE_CRON?: string;
+  TRAFFIC_SIMILARWEB_SEED_ENABLED?: boolean;
+  TRAFFIC_SIMILARWEB_SEED_CRON?: string;
   INGEST_AUTO_FEED_ENABLED?: boolean;
   INGEST_AUTO_FEED_CRON?: string;
   AI_RETRY_FEED_ENABLED?: boolean;
@@ -19,25 +22,52 @@ export async function setupScheduledJobs(queue: JobQueue, logger: Logger, env: S
     purpose: 'radar-bulk-sync',
   });
 
-  // Monthly traffic refresh seed: configured day of each month, 00:00 UTC
-  const trafficDay = env.TRAFFIC_REFRESH_START_DAY;
-  const trafficCron = `0 0 ${trafficDay} * *`;
-  await queue.addRepeatable(QUEUE_NAMES.traffic, {
-    pattern: trafficCron,
-    purpose: 'traffic-monthly-seed',
-  });
-
   const jobs = [
     'radar-bulk-sync (weekly Mon 02:00)',
-    `traffic-monthly-seed (${trafficDay}th 00:00)`,
   ];
+
+  if (env.TRAFFIC_MONTHLY_SEED_ENABLED) {
+    const trafficDay = env.TRAFFIC_REFRESH_START_DAY;
+    const trafficCron = `0 0 ${trafficDay} * *`;
+    await queue.addRepeatable(QUEUE_NAMES.traffic, {
+      pattern: trafficCron,
+      purpose: 'traffic-monthly-seed',
+    });
+    jobs.push(`traffic-monthly-seed (${trafficDay}th 00:00)`);
+  } else {
+    const removed = await queue.removeRepeatables(QUEUE_NAMES.traffic, 'traffic-monthly-seed');
+    if (removed > 0) {
+      jobs.push(`traffic-monthly-seed disabled (removed ${removed} legacy repeatable)`);
+    }
+  }
 
   if (env.TRAFFIC_FASTLANE_ENABLED) {
     await queue.addRepeatable(QUEUE_NAMES.traffic, {
-      pattern: env.TRAFFIC_FASTLANE_CRON || '*/10 * * * *',
+      pattern: env.TRAFFIC_FASTLANE_CRON || '15 * * * *',
       purpose: 'traffic-fastlane-seed',
     });
-    jobs.push(`traffic-fastlane-seed (${env.TRAFFIC_FASTLANE_CRON || '*/10 * * * *'})`);
+    jobs.push(`traffic-fastlane-seed (${env.TRAFFIC_FASTLANE_CRON || '15 * * * *'})`);
+  } else {
+    const removed = await queue.removeRepeatables(QUEUE_NAMES.traffic, 'traffic-fastlane-seed');
+    if (removed > 0) {
+      jobs.push(`traffic-fastlane-seed disabled (removed ${removed} legacy repeatable)`);
+    }
+  }
+
+  if (env.TRAFFIC_SIMILARWEB_SEED_ENABLED) {
+    await queue.addRepeatable(QUEUE_NAMES.traffic, {
+      pattern: env.TRAFFIC_SIMILARWEB_SEED_CRON || '0 * * * *',
+      purpose: 'traffic-similarweb-collect-seed',
+    });
+    jobs.push(`traffic-similarweb-collect-seed (${env.TRAFFIC_SIMILARWEB_SEED_CRON || '0 * * * *'})`);
+  } else {
+    const removed = await queue.removeRepeatables(
+      QUEUE_NAMES.traffic,
+      'traffic-similarweb-collect-seed',
+    );
+    if (removed > 0) {
+      jobs.push(`traffic-similarweb-collect-seed disabled (removed ${removed} legacy repeatable)`);
+    }
   }
 
   if (env.INGEST_AUTO_FEED_ENABLED) {

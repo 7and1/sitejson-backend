@@ -32,6 +32,7 @@ export type QueueJobPayload = {
     | 'radar-bulk-sync'
     | 'traffic-monthly-seed'
     | 'traffic-fastlane-seed'
+    | 'traffic-similarweb-collect-seed'
     | 'ingest-auto-feed'
     | 'ai-retry-feed'
     | 'ai-reclassify';

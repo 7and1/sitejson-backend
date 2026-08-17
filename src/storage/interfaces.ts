@@ -164,6 +164,10 @@ export interface CrawlTargetRepository {
     limit: number,
     options?: { maxSnapshotAgeDays?: number },
   ): Promise<string[]>;
+  getSimilarwebCollectSeedDomains(
+    limit: number,
+    options?: { maxSnapshotAgeDays?: number },
+  ): Promise<Array<{ domain: string; radarRank?: number }>>;
   getHighRankFirstRunDomains(
     limit: number,
     options?: { maxRadarRank?: number },
