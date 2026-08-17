@@ -6,16 +6,49 @@ import type { SiteReport } from '../core/types.js';
 import type { CrawlTargetRepository, JobRepository, SiteRepository } from '../storage/interfaces.js';
 import type { Orchestrator } from '../core/orchestrator.js';
 import { fetchWithRetry } from '../providers/http.js';
+import { z } from 'zod';
 
 const HOUR_MS = 3_600_000;
 const MONTHLY_TRAFFIC_RADAR_RANK_LIMIT = 100_000;
 const REDIS_SEED_HARD_STOP_RATIO = 0.85;
 // The SimilarWeb service caps /collect at 50 domains per request.
 const SIMILARWEB_COLLECT_REQUEST_LIMIT = 50;
-// Ten browser starts at one per minute finish inside this window under normal
-// conditions. Scheduling ingestion here ties it to the exact collected batch
-// and avoids racing an independent fastlane repeatable at the top of the hour.
-const SIMILARWEB_INGEST_FOLLOWUP_DELAY_MS = 15 * 60 * 1000;
+const DEFAULT_SIMILARWEB_FOLLOWUP_INITIAL_DELAY_MS = 15 * 60 * 1000;
+const DEFAULT_SIMILARWEB_FOLLOWUP_POLL_INTERVAL_MS = 5 * 60 * 1000;
+const DEFAULT_SIMILARWEB_FOLLOWUP_MAX_WAIT_MS = 45 * 60 * 1000;
+
+const similarwebCollectResponseSchema = z.object({
+  data: z.object({
+    total: z.number().int().nonnegative(),
+    queued: z.number().int().nonnegative(),
+    deduped: z.number().int().nonnegative(),
+    failed: z.number().int().nonnegative(),
+    results: z.array(z.object({
+      domain: z.string().min(1),
+      queued: z.boolean(),
+      deduped: z.boolean().optional(),
+      job_id: z.number().int().positive().optional(),
+      priority: z.enum(['high', 'normal', 'low']).optional(),
+      status: z.enum(['pending', 'processing', 'completed', 'failed']).optional(),
+      error: z.string().optional(),
+    })),
+  }),
+});
+
+const similarwebJobResponseSchema = z.object({
+  data: z.object({
+    job_id: z.number().int().positive(),
+    domain: z.string().min(1),
+    status: z.enum(['pending', 'processing', 'completed', 'failed']),
+    is_terminal: z.boolean(),
+  }),
+});
+
+const httpStatusFromError = (error: unknown): number | null => {
+  const message = error instanceof Error ? error.message : String(error);
+  const match = message.match(/(?:^|\b)HTTP_(\d{3})(?:\b|$)/i);
+  return match ? Number.parseInt(match[1], 10) : null;
+};
 
 export interface SimilarwebCollectSeedConfig {
   enabled: boolean;
@@ -24,6 +57,9 @@ export interface SimilarwebCollectSeedConfig {
   batchSize: number;
   maxSnapshotAgeDays: number;
   timeoutMs: number;
+  followupInitialDelayMs?: number;
+  followupPollIntervalMs?: number;
+  followupMaxWaitMs?: number;
 }
 
 export class TrafficWorker {
@@ -113,6 +149,11 @@ export class TrafficWorker {
       return;
     }
 
+    if (payload.purpose === 'traffic-similarweb-followup-check') {
+      await this.checkSimilarwebFollowup(payload);
+      return;
+    }
+
     const now = new Date();
     const [previous, target] = await Promise.all([
       this.sites.getByDomain(domain),
@@ -170,6 +211,7 @@ export class TrafficWorker {
         domain,
         module: 'traffic-worker',
         event: 'traffic_completed',
+        similarweb_job_id: payload.similarwebJobId,
         provider_ok: trafficProvider.ok,
         error_code: trafficProvider.errorCode,
         traffic_source: trafficProvider.source,
@@ -198,6 +240,7 @@ export class TrafficWorker {
         domain,
         module: 'traffic-worker',
         event: 'traffic_failed',
+        similarweb_job_id: payload.similarwebJobId,
         next_traffic_at: nextTrafficAt,
         error: error instanceof Error ? error.message : String(error),
       });
@@ -351,31 +394,119 @@ export class TrafficWorker {
     }
 
     const endpoint = `${baseUrl.replace(/\/+$/, '')}/api/v1/collect`;
-    const response = await fetchWithRetry(endpoint, {
-      timeoutMs: Math.max(1000, Math.trunc(config.timeoutMs)),
-      retryAttempts: 2,
-      retryBaseMs: 500,
-      requestInit: {
-        method: 'POST',
-        headers: {
-          accept: 'application/json',
-          'content-type': 'application/json',
-          'x-api-key': apiKey,
-        },
-        body: JSON.stringify({ domains, priority: 'low' }),
-      },
-    });
+    const startedAtMs = Date.now();
+    let responseStatus: number | null = null;
+    let responseBody: unknown;
 
-    const followupPayloads: QueueJobPayload[] = domains.map((domain) => ({
-      jobId: `traffic-similarweb-followup-${domain}`,
-      domain,
-      traceId,
-      source: 'system' as const,
-      phase: QUEUE_NAMES.traffic,
-      purpose: 'traffic-refresh' as const,
-      delayMs: SIMILARWEB_INGEST_FOLLOWUP_DELAY_MS,
-    }));
+    try {
+      const response = await fetchWithRetry(endpoint, {
+        timeoutMs: Math.max(1000, Math.trunc(config.timeoutMs)),
+        retryAttempts: 2,
+        retryBaseMs: 500,
+        requestInit: {
+          method: 'POST',
+          headers: {
+            accept: 'application/json',
+            'content-type': 'application/json',
+            'x-api-key': apiKey,
+          },
+          body: JSON.stringify({ domains, priority: 'low' }),
+        },
+      });
+      responseStatus = response.status;
+      responseBody = await response.json();
+    } catch (error) {
+      const fallbackPayloads = domains.map((domain) => (
+        this.buildTerminalTrafficPayload(domain, traceId, undefined, startedAtMs)
+      ));
+      await this.queue.enqueueBulk(fallbackPayloads, QUEUE_NAMES.traffic);
+      this.logger.error({
+        trace_id: traceId,
+        module: 'traffic-worker',
+        event: 'similarweb_collect_seed_request_failed',
+        count: domains.length,
+        response_status: httpStatusFromError(error),
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return;
+    }
+
+    const parsedResponse = similarwebCollectResponseSchema.safeParse(responseBody);
+    if (!parsedResponse.success) {
+      const fallbackPayloads = domains.map((domain) => (
+        this.buildTerminalTrafficPayload(domain, traceId, undefined, startedAtMs)
+      ));
+      await this.queue.enqueueBulk(fallbackPayloads, QUEUE_NAMES.traffic);
+      this.logger.error({
+        trace_id: traceId,
+        module: 'traffic-worker',
+        event: 'similarweb_collect_seed_invalid_response',
+        count: domains.length,
+        response_status: responseStatus,
+        validation_issue_count: parsedResponse.error.issues.length,
+      });
+      return;
+    }
+
+    const resultsByDomain = new Map<
+      string,
+      (typeof parsedResponse.data.data.results)[number] | null
+    >();
+    for (const result of parsedResponse.data.data.results) {
+      const normalizedDomain = result.domain.trim().toLowerCase();
+      resultsByDomain.set(
+        normalizedDomain,
+        resultsByDomain.has(normalizedDomain) ? null : result,
+      );
+    }
+
+    const initialDelayMs = this.resolvePositiveDuration(
+      config.followupInitialDelayMs,
+      DEFAULT_SIMILARWEB_FOLLOWUP_INITIAL_DELAY_MS,
+    );
+    const maxWaitMs = this.resolvePositiveDuration(
+      config.followupMaxWaitMs,
+      DEFAULT_SIMILARWEB_FOLLOWUP_MAX_WAIT_MS,
+    );
+    const followupDeadlineAt = new Date(startedAtMs + maxWaitMs).toISOString();
+    let checkCount = 0;
+    let fallbackCount = 0;
+    const followupPayloads: QueueJobPayload[] = domains.map((domain) => {
+      const result = resultsByDomain.get(domain.toLowerCase());
+      if (!result?.job_id) {
+        fallbackCount += 1;
+        return this.buildTerminalTrafficPayload(domain, traceId, undefined, startedAtMs);
+      }
+
+      checkCount += 1;
+      return {
+        jobId: this.buildFollowupCheckJobId(domain, result.job_id, 1),
+        domain,
+        traceId,
+        source: 'system' as const,
+        phase: QUEUE_NAMES.traffic,
+        purpose: 'traffic-similarweb-followup-check' as const,
+        similarwebJobId: result.job_id,
+        followupAttempt: 1,
+        followupDeadlineAt,
+        delayMs: initialDelayMs,
+      };
+    });
     await this.queue.enqueueBulk(followupPayloads, QUEUE_NAMES.traffic);
+    for (const followup of followupPayloads) {
+      if (followup.purpose !== 'traffic-similarweb-followup-check') {
+        continue;
+      }
+      this.logger.info({
+        trace_id: traceId,
+        domain: followup.domain,
+        module: 'traffic-worker',
+        event: 'similarweb_followup_scheduled',
+        similarweb_job_id: followup.similarwebJobId,
+        followup_attempt: 1,
+        followup_deadline_at: followup.followupDeadlineAt,
+      });
+    }
 
     this.logger.info({
       trace_id: traceId,
@@ -384,8 +515,219 @@ export class TrafficWorker {
       count: domains.length,
       first_domain: domains[0],
       last_domain: domains[domains.length - 1],
-      response_status: response.status,
-      ingest_followup_delay_ms: SIMILARWEB_INGEST_FOLLOWUP_DELAY_MS,
+      response_status: responseStatus,
+      followup_check_count: checkCount,
+      fallback_count: fallbackCount,
+      followup_initial_delay_ms: initialDelayMs,
+      followup_max_wait_ms: maxWaitMs,
+    });
+  }
+
+  private resolvePositiveDuration(value: number | undefined, fallback: number): number {
+    if (value == null || !Number.isFinite(value) || value <= 0) {
+      return fallback;
+    }
+    return Math.max(1, Math.trunc(value));
+  }
+
+  private buildFollowupCheckJobId(domain: string, similarwebJobId: number, attempt: number): string {
+    return `traffic-similarweb-check-${domain}-${similarwebJobId}-${attempt}`;
+  }
+
+  private buildTerminalTrafficPayload(
+    domain: string,
+    traceId: string,
+    similarwebJobId?: number,
+    fallbackTimestampMs = Date.now(),
+  ): QueueJobPayload {
+    const terminalKey = similarwebJobId
+      ? String(similarwebJobId)
+      : `collect-${new Date(fallbackTimestampMs).toISOString().slice(0, 13).replace(/[-T]/g, '')}`;
+    return {
+      jobId: `traffic-similarweb-terminal-${domain}-${terminalKey}`,
+      domain,
+      traceId,
+      source: 'system',
+      phase: QUEUE_NAMES.traffic,
+      purpose: 'traffic-refresh',
+      forceRefresh: true,
+      ...(similarwebJobId ? { similarwebJobId } : {}),
+    };
+  }
+
+  private async enqueueNextSimilarwebCheck(
+    payload: QueueJobPayload,
+    deadlineMs: number,
+  ): Promise<void> {
+    const config = this.similarwebCollectSeed;
+    const similarwebJobId = payload.similarwebJobId as number;
+    const nextAttempt = Math.max(1, Math.trunc(payload.followupAttempt ?? 1)) + 1;
+    const pollIntervalMs = this.resolvePositiveDuration(
+      config?.followupPollIntervalMs,
+      DEFAULT_SIMILARWEB_FOLLOWUP_POLL_INTERVAL_MS,
+    );
+    const remainingMs = Math.max(1, deadlineMs - Date.now());
+
+    await this.queue.enqueue({
+      ...payload,
+      jobId: this.buildFollowupCheckJobId(payload.domain, similarwebJobId, nextAttempt),
+      purpose: 'traffic-similarweb-followup-check',
+      followupAttempt: nextAttempt,
+      delayMs: Math.min(pollIntervalMs, remainingMs),
+    }, QUEUE_NAMES.traffic);
+  }
+
+  private async enqueueSimilarwebTerminal(
+    payload: QueueJobPayload,
+    event: 'similarweb_followup_completed'
+      | 'similarweb_followup_failed'
+      | 'similarweb_followup_timeout'
+      | 'similarweb_followup_auth_error'
+      | 'similarweb_followup_http_terminal'
+      | 'similarweb_followup_invalid_response',
+    details: Record<string, unknown> = {},
+  ): Promise<void> {
+    await this.queue.enqueue(
+      this.buildTerminalTrafficPayload(
+        payload.domain,
+        payload.traceId,
+        payload.similarwebJobId,
+      ),
+      QUEUE_NAMES.traffic,
+    );
+
+    const log = {
+      trace_id: payload.traceId,
+      domain: payload.domain,
+      module: 'traffic-worker',
+      event,
+      similarweb_job_id: payload.similarwebJobId,
+      followup_attempt: payload.followupAttempt ?? 1,
+      ...details,
+    };
+    if (event === 'similarweb_followup_auth_error') {
+      this.logger.error(log);
+    } else if (
+      event === 'similarweb_followup_timeout'
+      || event === 'similarweb_followup_http_terminal'
+      || event === 'similarweb_followup_invalid_response'
+    ) {
+      this.logger.warn(log);
+    } else {
+      this.logger.info(log);
+    }
+  }
+
+  private async checkSimilarwebFollowup(payload: QueueJobPayload): Promise<void> {
+    const config = this.similarwebCollectSeed;
+    const baseUrl = config?.baseUrl?.trim();
+    const apiKey = config?.apiKey?.trim();
+    const similarwebJobId = payload.similarwebJobId;
+    const deadlineMs = this.parseTimestamp(payload.followupDeadlineAt);
+
+    if (!baseUrl || !apiKey || !Number.isInteger(similarwebJobId) || similarwebJobId! <= 0 || deadlineMs === null) {
+      await this.enqueueSimilarwebTerminal(payload, 'similarweb_followup_invalid_response', {
+        reason: 'invalid_followup_payload_or_config',
+      });
+      return;
+    }
+
+    const endpoint = `${baseUrl.replace(/\/+$/, '')}/api/v1/jobs/${similarwebJobId}`;
+    let responseBody: unknown;
+    try {
+      const response = await fetchWithRetry(endpoint, {
+        timeoutMs: Math.max(1000, Math.trunc(config?.timeoutMs ?? 12000)),
+        retryAttempts: 2,
+        retryBaseMs: 500,
+        requestInit: {
+          method: 'GET',
+          headers: {
+            accept: 'application/json',
+            'x-api-key': apiKey,
+          },
+        },
+      });
+      responseBody = await response.json();
+    } catch (error) {
+      const responseStatus = httpStatusFromError(error);
+      if (responseStatus === 401 || responseStatus === 403) {
+        await this.enqueueSimilarwebTerminal(payload, 'similarweb_followup_auth_error', {
+          response_status: responseStatus,
+        });
+        return;
+      }
+      if (responseStatus !== null && responseStatus >= 400 && responseStatus < 500) {
+        await this.enqueueSimilarwebTerminal(payload, 'similarweb_followup_http_terminal', {
+          response_status: responseStatus,
+        });
+        return;
+      }
+      if (Date.now() < deadlineMs) {
+        await this.enqueueNextSimilarwebCheck(payload, deadlineMs);
+        this.logger.warn({
+          trace_id: payload.traceId,
+          domain: payload.domain,
+          module: 'traffic-worker',
+          event: 'similarweb_followup_recheck_scheduled',
+          similarweb_job_id: similarwebJobId,
+          followup_attempt: payload.followupAttempt ?? 1,
+          response_status: responseStatus,
+          reason: 'request_failed',
+        });
+        return;
+      }
+      await this.enqueueSimilarwebTerminal(payload, 'similarweb_followup_timeout', {
+        response_status: responseStatus,
+        reason: 'request_failed_at_deadline',
+      });
+      return;
+    }
+
+    const parsedResponse = similarwebJobResponseSchema.safeParse(responseBody);
+    if (!parsedResponse.success) {
+      await this.enqueueSimilarwebTerminal(payload, 'similarweb_followup_invalid_response', {
+        validation_issue_count: parsedResponse.error.issues.length,
+      });
+      return;
+    }
+
+    const job = parsedResponse.data.data;
+    const terminalStatus = job.status === 'completed' || job.status === 'failed';
+    if (
+      job.job_id !== similarwebJobId
+      || job.domain.trim().toLowerCase() !== payload.domain.toLowerCase()
+      || job.is_terminal !== terminalStatus
+    ) {
+      await this.enqueueSimilarwebTerminal(payload, 'similarweb_followup_invalid_response', {
+        reason: 'job_identity_or_terminal_mismatch',
+      });
+      return;
+    }
+
+    if (job.status === 'completed') {
+      await this.enqueueSimilarwebTerminal(payload, 'similarweb_followup_completed');
+      return;
+    }
+    if (job.status === 'failed') {
+      await this.enqueueSimilarwebTerminal(payload, 'similarweb_followup_failed');
+      return;
+    }
+    if (Date.now() >= deadlineMs) {
+      await this.enqueueSimilarwebTerminal(payload, 'similarweb_followup_timeout', {
+        upstream_status: job.status,
+      });
+      return;
+    }
+
+    await this.enqueueNextSimilarwebCheck(payload, deadlineMs);
+    this.logger.info({
+      trace_id: payload.traceId,
+      domain: payload.domain,
+      module: 'traffic-worker',
+      event: 'similarweb_followup_recheck_scheduled',
+      similarweb_job_id: similarwebJobId,
+      followup_attempt: payload.followupAttempt ?? 1,
+      upstream_status: job.status,
     });
   }
 

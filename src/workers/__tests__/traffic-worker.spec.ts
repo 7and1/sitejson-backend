@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 const { fetchWithRetry } = vi.hoisted(() => ({
   fetchWithRetry: vi.fn(),
@@ -16,6 +16,70 @@ const noopLogger = {
   error: vi.fn(),
   debug: vi.fn(),
 };
+
+const similarwebResponse = (data: unknown, status = 200) => ({
+  status,
+  json: vi.fn().mockResolvedValue(data),
+});
+
+const makeSimilarwebWorker = (options?: {
+  domains?: string[];
+  initialDelayMs?: number;
+  pollIntervalMs?: number;
+  maxWaitMs?: number;
+}) => {
+  const domains = options?.domains ?? ['example.com'];
+  const queue = {
+    enqueue: vi.fn(),
+    enqueueBulk: vi.fn(),
+  };
+  const crawlTargets = {
+    getByDomain: vi.fn().mockResolvedValue(null),
+    update: vi.fn(),
+    getSimilarwebCollectSeedDomains: vi.fn().mockResolvedValue(
+      domains.map((domain, index) => ({ domain, radarRank: index + 1 })),
+    ),
+  };
+  const logger = {
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    debug: vi.fn(),
+  };
+  const worker = new TrafficWorker(
+    queue as any,
+    { getByDomain: vi.fn(), upsert: vi.fn() } as any,
+    crawlTargets as any,
+    { markRunning: vi.fn(), markFailed: vi.fn() } as any,
+    { analyze: vi.fn() } as any,
+    logger as any,
+    30,
+    24 * 30,
+    24 * 7,
+    24 * 30,
+    10,
+    30,
+    false,
+    {
+      enabled: true,
+      baseUrl: 'http://sitejson-similarweb-api:3000',
+      apiKey: 'internal-test-key',
+      batchSize: 10,
+      maxSnapshotAgeDays: 30,
+      timeoutMs: 12000,
+      followupInitialDelayMs: options?.initialDelayMs ?? 15 * 60 * 1000,
+      followupPollIntervalMs: options?.pollIntervalMs ?? 5 * 60 * 1000,
+      followupMaxWaitMs: options?.maxWaitMs ?? 45 * 60 * 1000,
+    },
+  );
+
+  return { worker, queue, crawlTargets, logger };
+};
+
+afterEach(() => {
+  vi.useRealTimers();
+  vi.clearAllMocks();
+});
 
 describe('TrafficWorker', () => {
   it('applies no-data cooldown and increments error count', async () => {
@@ -413,7 +477,23 @@ describe('TrafficWorker', () => {
     const orchestrator = {
       analyze: vi.fn(),
     };
-    fetchWithRetry.mockResolvedValueOnce({ status: 202 });
+    fetchWithRetry.mockResolvedValueOnce(similarwebResponse({
+      data: {
+        total: 50,
+        queued: 50,
+        deduped: 0,
+        failed: 0,
+        results: ranked.map((item, index) => ({
+          domain: item.domain,
+          queued: true,
+          deduped: false,
+          job_id: index + 1,
+          priority: 'low',
+          status: 'pending',
+        })),
+      },
+      meta: { timestamp: '2026-08-17T00:00:00.000Z' },
+    }, 202));
 
     const worker = new TrafficWorker(
       queue as any,
@@ -464,10 +544,261 @@ describe('TrafficWorker', () => {
     expect(queueName).toBe('traffic');
     expect(followups).toHaveLength(50);
     expect(followups[0]).toMatchObject({
-      jobId: 'traffic-similarweb-followup-rank-01.example',
+      jobId: 'traffic-similarweb-check-rank-01.example-1-1',
       domain: 'rank-01.example',
-      purpose: 'traffic-refresh',
+      purpose: 'traffic-similarweb-followup-check',
+      similarwebJobId: 1,
+      followupAttempt: 1,
       delayMs: 15 * 60 * 1000,
     });
+  });
+
+  it('falls back only missing or invalid collect rows while preserving valid job checks', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-08-17T01:00:00.000Z'));
+    const { worker, queue } = makeSimilarwebWorker({
+      domains: ['good.example', 'missing.example', 'failed.example'],
+    });
+    fetchWithRetry.mockResolvedValueOnce(similarwebResponse({
+      data: {
+        total: 3,
+        queued: 1,
+        deduped: 0,
+        failed: 2,
+        results: [
+          { domain: 'good.example', queued: true, job_id: 41, status: 'pending' },
+          { domain: 'failed.example', queued: false, error: 'queue rejected' },
+        ],
+      },
+    }, 202));
+
+    await worker.process({
+      jobId: 'seed', domain: '', traceId: 'trc-partial', phase: 'traffic',
+      purpose: 'traffic-similarweb-collect-seed',
+    });
+
+    const [payloads] = queue.enqueueBulk.mock.calls[0];
+    expect(payloads).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        jobId: 'traffic-similarweb-check-good.example-41-1',
+        purpose: 'traffic-similarweb-followup-check',
+        similarwebJobId: 41,
+        followupDeadlineAt: '2026-08-17T01:45:00.000Z',
+      }),
+      expect.objectContaining({
+        domain: 'missing.example',
+        purpose: 'traffic-refresh',
+        forceRefresh: true,
+      }),
+      expect.objectContaining({
+        domain: 'failed.example',
+        purpose: 'traffic-refresh',
+        forceRefresh: true,
+      }),
+    ]));
+  });
+
+  it('falls back every candidate when the collect response shape is invalid', async () => {
+    const { worker, queue, logger } = makeSimilarwebWorker({ domains: ['a.example', 'b.example'] });
+    fetchWithRetry.mockResolvedValueOnce(similarwebResponse({ data: { results: 'invalid' } }, 202));
+
+    await worker.process({
+      jobId: 'seed', domain: '', traceId: 'trc-invalid', phase: 'traffic',
+      purpose: 'traffic-similarweb-collect-seed',
+    });
+
+    const [payloads] = queue.enqueueBulk.mock.calls[0];
+    expect(payloads).toHaveLength(2);
+    expect(payloads.every((payload: any) => (
+      payload.purpose === 'traffic-refresh' && payload.forceRefresh === true
+    ))).toBe(true);
+    expect(logger.error).toHaveBeenCalledWith(expect.objectContaining({
+      event: 'similarweb_collect_seed_invalid_response',
+    }));
+  });
+
+  it('polls pending SimilarWeb jobs every five minutes without calling traffic directly', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-08-17T01:15:00.000Z'));
+    const { worker, queue } = makeSimilarwebWorker();
+    fetchWithRetry.mockResolvedValueOnce(similarwebResponse({
+      data: {
+        job_id: 71,
+        domain: 'example.com',
+        status: 'pending',
+        is_terminal: false,
+      },
+    }));
+
+    await worker.process({
+      jobId: 'check-1', domain: 'example.com', traceId: 'trc-check', phase: 'traffic',
+      purpose: 'traffic-similarweb-followup-check', similarwebJobId: 71,
+      followupAttempt: 1, followupDeadlineAt: '2026-08-17T01:45:00.000Z',
+    });
+
+    expect(queue.enqueue).toHaveBeenCalledWith(expect.objectContaining({
+      jobId: 'traffic-similarweb-check-example.com-71-2',
+      purpose: 'traffic-similarweb-followup-check',
+      followupAttempt: 2,
+      delayMs: 5 * 60 * 1000,
+    }), 'traffic');
+  });
+
+  it.each([
+    ['completed', 'similarweb_followup_completed'],
+    ['failed', 'similarweb_followup_failed'],
+  ])('enqueues one stable forced traffic refresh for %s jobs', async (status, event) => {
+    const { worker, queue, logger } = makeSimilarwebWorker();
+    fetchWithRetry.mockResolvedValue(similarwebResponse({
+      data: {
+        job_id: 72,
+        domain: 'example.com',
+        status,
+        is_terminal: true,
+      },
+    }));
+    const payload = {
+      jobId: 'check-1', domain: 'example.com', traceId: 'trc-terminal', phase: 'traffic' as const,
+      purpose: 'traffic-similarweb-followup-check' as const, similarwebJobId: 72,
+      followupAttempt: 1, followupDeadlineAt: '2099-01-01T00:00:00.000Z',
+    };
+
+    await worker.process(payload);
+    await worker.process(payload);
+
+    expect(queue.enqueue).toHaveBeenCalledTimes(2);
+    expect(queue.enqueue.mock.calls[0][0]).toMatchObject({
+      jobId: 'traffic-similarweb-terminal-example.com-72',
+      purpose: 'traffic-refresh',
+      forceRefresh: true,
+    });
+    expect(queue.enqueue.mock.calls[1][0].jobId).toBe(queue.enqueue.mock.calls[0][0].jobId);
+    expect(logger.info).toHaveBeenCalledWith(expect.objectContaining({ event }));
+  });
+
+  it('times out a non-terminal job at 45 minutes and enters fallback once', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-08-17T01:45:00.000Z'));
+    const { worker, queue, logger } = makeSimilarwebWorker();
+    fetchWithRetry.mockResolvedValueOnce(similarwebResponse({
+      data: {
+        job_id: 73,
+        domain: 'example.com',
+        status: 'processing',
+        is_terminal: false,
+      },
+    }));
+
+    await worker.process({
+      jobId: 'check-7', domain: 'example.com', traceId: 'trc-timeout', phase: 'traffic',
+      purpose: 'traffic-similarweb-followup-check', similarwebJobId: 73,
+      followupAttempt: 7, followupDeadlineAt: '2026-08-17T01:45:00.000Z',
+    });
+
+    expect(queue.enqueue).toHaveBeenCalledWith(expect.objectContaining({
+      jobId: 'traffic-similarweb-terminal-example.com-73',
+      purpose: 'traffic-refresh',
+      forceRefresh: true,
+    }), 'traffic');
+    expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({
+      event: 'similarweb_followup_timeout',
+    }));
+  });
+
+  it.each([401, 403])('does not poll again after SimilarWeb auth HTTP %s', async (status) => {
+    const { worker, queue, logger } = makeSimilarwebWorker();
+    fetchWithRetry.mockRejectedValueOnce(new Error(`HTTP_${status}`));
+
+    await worker.process({
+      jobId: 'check-auth', domain: 'example.com', traceId: 'trc-auth', phase: 'traffic',
+      purpose: 'traffic-similarweb-followup-check', similarwebJobId: 74,
+      followupAttempt: 1, followupDeadlineAt: '2099-01-01T00:00:00.000Z',
+    });
+
+    expect(queue.enqueue).toHaveBeenCalledWith(expect.objectContaining({
+      jobId: 'traffic-similarweb-terminal-example.com-74',
+      purpose: 'traffic-refresh',
+      forceRefresh: true,
+    }), 'traffic');
+    expect(logger.error).toHaveBeenCalledWith(expect.objectContaining({
+      event: 'similarweb_followup_auth_error',
+      response_status: status,
+    }));
+  });
+
+  it('rechecks retry-exhausted 5xx failures before deadline and falls back on 404', async () => {
+    const { worker, queue, logger } = makeSimilarwebWorker();
+    const basePayload = {
+      domain: 'example.com', traceId: 'trc-http', phase: 'traffic' as const,
+      purpose: 'traffic-similarweb-followup-check' as const, similarwebJobId: 75,
+      followupAttempt: 1, followupDeadlineAt: '2099-01-01T00:00:00.000Z',
+    };
+    fetchWithRetry.mockRejectedValueOnce(new Error('HTTP_503'));
+    await worker.process({ ...basePayload, jobId: 'check-5xx' });
+    expect(queue.enqueue).toHaveBeenLastCalledWith(expect.objectContaining({
+      purpose: 'traffic-similarweb-followup-check',
+      followupAttempt: 2,
+    }), 'traffic');
+
+    fetchWithRetry.mockRejectedValueOnce(new Error('HTTP_404'));
+    await worker.process({ ...basePayload, jobId: 'check-404' });
+    expect(queue.enqueue).toHaveBeenLastCalledWith(expect.objectContaining({
+      jobId: 'traffic-similarweb-terminal-example.com-75',
+      purpose: 'traffic-refresh',
+    }), 'traffic');
+    expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({
+      event: 'similarweb_followup_http_terminal',
+      response_status: 404,
+    }));
+  });
+
+  it('falls back after a network timeout at the follow-up deadline', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-08-17T01:45:00.000Z'));
+    const { worker, queue, logger } = makeSimilarwebWorker();
+    fetchWithRetry.mockRejectedValueOnce(new Error('UND_ERR_CONNECT_TIMEOUT'));
+
+    await worker.process({
+      jobId: 'check-network-deadline', domain: 'example.com', traceId: 'trc-network',
+      phase: 'traffic', purpose: 'traffic-similarweb-followup-check', similarwebJobId: 76,
+      followupAttempt: 7, followupDeadlineAt: '2026-08-17T01:45:00.000Z',
+    });
+
+    expect(queue.enqueue).toHaveBeenCalledWith(expect.objectContaining({
+      jobId: 'traffic-similarweb-terminal-example.com-76',
+      purpose: 'traffic-refresh',
+      forceRefresh: true,
+    }), 'traffic');
+    expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({
+      event: 'similarweb_followup_timeout',
+      reason: 'request_failed_at_deadline',
+    }));
+  });
+
+  it('falls back when a job response has mismatched identity or terminal semantics', async () => {
+    const { worker, queue, logger } = makeSimilarwebWorker();
+    fetchWithRetry.mockResolvedValueOnce(similarwebResponse({
+      data: {
+        job_id: 77,
+        domain: 'other.example',
+        status: 'completed',
+        is_terminal: false,
+      },
+    }));
+
+    await worker.process({
+      jobId: 'check-invalid-job', domain: 'example.com', traceId: 'trc-invalid-job',
+      phase: 'traffic', purpose: 'traffic-similarweb-followup-check', similarwebJobId: 77,
+      followupAttempt: 1, followupDeadlineAt: '2099-01-01T00:00:00.000Z',
+    });
+
+    expect(queue.enqueue).toHaveBeenCalledWith(expect.objectContaining({
+      jobId: 'traffic-similarweb-terminal-example.com-77',
+      forceRefresh: true,
+    }), 'traffic');
+    expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({
+      event: 'similarweb_followup_invalid_response',
+      reason: 'job_identity_or_terminal_mismatch',
+    }));
   });
 });

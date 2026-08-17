@@ -20,6 +20,9 @@ export type QueueJobPayload = {
   contentHash?: string;
   isHighValue?: boolean;
   delayMs?: number;
+  similarwebJobId?: number;
+  followupAttempt?: number;
+  followupDeadlineAt?: string;
   screenshotUrl?: string;
   webhookUrl?: string;
   purpose?:
@@ -33,6 +36,7 @@ export type QueueJobPayload = {
     | 'traffic-monthly-seed'
     | 'traffic-fastlane-seed'
     | 'traffic-similarweb-collect-seed'
+    | 'traffic-similarweb-followup-check'
     | 'ingest-auto-feed'
     | 'ai-retry-feed'
     | 'ai-reclassify';

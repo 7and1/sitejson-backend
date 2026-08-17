@@ -166,6 +166,21 @@ describe('loadEnv', () => {
     expect(env.PG_POOL_MAX_API).toBeUndefined();
     expect(env.PG_POOL_MAX_WORKER).toBeUndefined();
     expect(env.DIRECTORY_CACHE_PREWARM_TOP_SLUGS).toBe(25);
+    expect(env.TRAFFIC_SIMILARWEB_FOLLOWUP_INITIAL_DELAY_MS).toBe(900_000);
+    expect(env.TRAFFIC_SIMILARWEB_FOLLOWUP_POLL_INTERVAL_MS).toBe(300_000);
+    expect(env.TRAFFIC_SIMILARWEB_FOLLOWUP_MAX_WAIT_MS).toBe(2_700_000);
+  });
+
+  it('parses SimilarWeb follow-up timing overrides', () => {
+    process.env.TRAFFIC_SIMILARWEB_FOLLOWUP_INITIAL_DELAY_MS = '600000';
+    process.env.TRAFFIC_SIMILARWEB_FOLLOWUP_POLL_INTERVAL_MS = '120000';
+    process.env.TRAFFIC_SIMILARWEB_FOLLOWUP_MAX_WAIT_MS = '1800000';
+
+    const env = loadEnv();
+
+    expect(env.TRAFFIC_SIMILARWEB_FOLLOWUP_INITIAL_DELAY_MS).toBe(600_000);
+    expect(env.TRAFFIC_SIMILARWEB_FOLLOWUP_POLL_INTERVAL_MS).toBe(120_000);
+    expect(env.TRAFFIC_SIMILARWEB_FOLLOWUP_MAX_WAIT_MS).toBe(1_800_000);
   });
 
   it('allows disabling the public insights route limiter explicitly', () => {

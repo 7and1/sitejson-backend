@@ -183,6 +183,9 @@ const startWorker = async () => {
         batchSize: runtime.env.TRAFFIC_SIMILARWEB_SEED_BATCH_SIZE,
         maxSnapshotAgeDays: runtime.env.TRAFFIC_FASTLANE_MAX_SNAPSHOT_AGE_DAYS,
         timeoutMs: runtime.env.TRAFFIC_SIMILARWEB_TIMEOUT_MS,
+        followupInitialDelayMs: runtime.env.TRAFFIC_SIMILARWEB_FOLLOWUP_INITIAL_DELAY_MS,
+        followupPollIntervalMs: runtime.env.TRAFFIC_SIMILARWEB_FOLLOWUP_POLL_INTERVAL_MS,
+        followupMaxWaitMs: runtime.env.TRAFFIC_SIMILARWEB_FOLLOWUP_MAX_WAIT_MS,
       },
     );
     startPromises.push(trafficWorker.start());
