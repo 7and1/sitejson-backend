@@ -446,7 +446,7 @@ describe('TrafficWorker', () => {
     expect(queue.enqueueBulk).not.toHaveBeenCalled();
   });
 
-  it('seeds SimilarWeb in Radar-rank order and caps one request at 50 domains', async () => {
+  it('caps the hourly SimilarWeb seed at ten low-priority domains and preserves follow-ups', async () => {
     const queue = {
       enqueue: vi.fn(),
       enqueueBulk: vi.fn(),
@@ -461,7 +461,7 @@ describe('TrafficWorker', () => {
       getByDomain: vi.fn(),
       upsert: vi.fn(),
     };
-    const ranked = Array.from({ length: 50 }, (_, index) => ({
+    const ranked = Array.from({ length: 10 }, (_, index) => ({
       domain: `rank-${String(index + 1).padStart(2, '0')}.example`,
       radarRank: index + 1,
     }));
@@ -479,8 +479,8 @@ describe('TrafficWorker', () => {
     };
     fetchWithRetry.mockResolvedValueOnce(similarwebResponse({
       data: {
-        total: 50,
-        queued: 50,
+        total: 10,
+        queued: 10,
         deduped: 0,
         failed: 0,
         results: ranked.map((item, index) => ({
@@ -527,7 +527,7 @@ describe('TrafficWorker', () => {
       purpose: 'traffic-similarweb-collect-seed',
     });
 
-    expect(crawlTargets.getSimilarwebCollectSeedDomains).toHaveBeenCalledWith(50, {
+    expect(crawlTargets.getSimilarwebCollectSeedDomains).toHaveBeenCalledWith(10, {
       maxSnapshotAgeDays: 30,
     });
     expect(fetchWithRetry).toHaveBeenCalledTimes(1);
@@ -536,13 +536,13 @@ describe('TrafficWorker', () => {
     expect(options.requestInit.headers['x-api-key']).toBe('internal-test-key');
     const body = JSON.parse(options.requestInit.body as string);
     expect(body.priority).toBe('low');
-    expect(body.domains).toHaveLength(50);
+    expect(body.domains).toHaveLength(10);
     expect(body.domains[0]).toBe('rank-01.example');
-    expect(body.domains[49]).toBe('rank-50.example');
+    expect(body.domains[9]).toBe('rank-10.example');
     expect(queue.enqueueBulk).toHaveBeenCalledTimes(1);
     const [followups, queueName] = queue.enqueueBulk.mock.calls[0];
     expect(queueName).toBe('traffic');
-    expect(followups).toHaveLength(50);
+    expect(followups).toHaveLength(10);
     expect(followups[0]).toMatchObject({
       jobId: 'traffic-similarweb-check-rank-01.example-1-1',
       domain: 'rank-01.example',

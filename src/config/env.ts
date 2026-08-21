@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { SIMILARWEB_SEED_MAX_BATCH_SIZE } from '../lib/similarweb-seed.js';
 
 const parseViewport = (value: string): { width: number; height: number } => {
   const match = value.match(/^(\d+)x(\d+)$/i);
@@ -253,7 +254,7 @@ const envSchema = z.object({
   TRAFFIC_FASTLANE_MAX_SNAPSHOT_AGE_DAYS: z.coerce.number().int().min(1).max(365).default(30),
   TRAFFIC_SIMILARWEB_SEED_ENABLED: booleanFromEnv(true),
   TRAFFIC_SIMILARWEB_SEED_CRON: z.string().default('0 * * * *'),
-  TRAFFIC_SIMILARWEB_SEED_BATCH_SIZE: z.coerce.number().int().min(1).max(50).default(10),
+  TRAFFIC_SIMILARWEB_SEED_BATCH_SIZE: z.coerce.number().int().min(1).max(SIMILARWEB_SEED_MAX_BATCH_SIZE).default(10),
   TRAFFIC_SIMILARWEB_FOLLOWUP_INITIAL_DELAY_MS: z.coerce.number().int().positive().default(900000),
   TRAFFIC_SIMILARWEB_FOLLOWUP_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(300000),
   TRAFFIC_SIMILARWEB_FOLLOWUP_MAX_WAIT_MS: z.coerce.number().int().positive().default(2700000),

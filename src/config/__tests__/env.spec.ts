@@ -183,6 +183,16 @@ describe('loadEnv', () => {
     expect(env.TRAFFIC_SIMILARWEB_FOLLOWUP_MAX_WAIT_MS).toBe(1_800_000);
   });
 
+  it('rejects SimilarWeb seed batches above the production limit at startup', () => {
+    process.env.NODE_ENV = 'production';
+    process.env.SITEJSON_API_KEY = STRONG_API_KEY;
+    process.env.SITEJSON_OPS_API_KEY = STRONG_OPS_KEY;
+    process.env.CORS_ALLOWLIST = PRODUCTION_CORS_ALLOWLIST;
+    process.env.TRAFFIC_SIMILARWEB_SEED_BATCH_SIZE = '11';
+
+    expect(() => loadEnv()).toThrow(/TRAFFIC_SIMILARWEB_SEED_BATCH_SIZE/);
+  });
+
   it('allows disabling the public insights route limiter explicitly', () => {
     process.env.INSIGHTS_RATE_LIMIT_PER_MIN = '0';
 

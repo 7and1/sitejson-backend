@@ -25,6 +25,10 @@ import type {
   TaxonomyData,
   TrafficRefreshOptions,
 } from './interfaces.js';
+import {
+  getSimilarwebSeedBucketQuotas,
+  SIMILARWEB_SEED_MAX_BATCH_SIZE,
+} from '../lib/similarweb-seed.js';
 import type { Logger } from '../observability/logger.js';
 import { mergeSiteReports, sanitizeSiteReport } from '../services/report-merge.js';
 import { calculateLegitimacyScore, withCalculatedLegitimacyScore } from '../scoring/legitimacy.js';
@@ -2452,25 +2456,81 @@ export class PostgresCrawlTargetRepository implements CrawlTargetRepository {
     limit: number,
     options?: { maxSnapshotAgeDays?: number },
   ): Promise<Array<{ domain: string; radarRank?: number }>> {
-    const safeLimit = Math.max(1, Math.min(50, Math.trunc(limit)));
+    const normalizedLimit = Number.isFinite(limit) ? Math.trunc(limit) : 1;
+    const safeLimit = Math.max(1, Math.min(SIMILARWEB_SEED_MAX_BATCH_SIZE, normalizedLimit));
     const maxSnapshotAgeDays = Math.max(1, Math.trunc(options?.maxSnapshotAgeDays ?? 30));
-    const result = await this.pool.query<{ domain: string; radar_rank: number | null }>(
-      `SELECT ct.domain, ct.radar_rank
-       FROM crawl_targets ct
-       INNER JOIN site_profiles sp ON sp.domain = ct.domain
-       WHERE (ct.next_traffic_at IS NULL OR ct.next_traffic_at <= NOW())
-         AND (
-           ct.last_traffic_at IS NULL
-           OR ct.last_traffic_at <= NOW() - (($2::text || ' days')::interval)
+    const bucketQuotas = getSimilarwebSeedBucketQuotas(safeLimit);
+    const result = await this.pool.query<{ domain: string; radar_rank: number }>(
+      `WITH eligible AS NOT MATERIALIZED (
+         SELECT
+           ct.domain,
+           ct.radar_rank,
+           ct.updated_at
+         FROM crawl_targets ct
+         INNER JOIN site_profiles sp ON sp.domain = ct.domain
+         WHERE ct.radar_rank BETWEEN 1 AND 1000000
+           AND (ct.next_traffic_at IS NULL OR ct.next_traffic_at <= NOW())
+           AND (
+             ct.last_traffic_at IS NULL
+             OR ct.last_traffic_at <= NOW() - (($2::text || ' days')::interval)
+           )
+       ), bucket_1 AS (
+         SELECT domain, radar_rank, updated_at
+         FROM eligible
+         WHERE radar_rank BETWEEN 1 AND 1000
+         ORDER BY radar_rank ASC, updated_at ASC, domain ASC
+         LIMIT $3
+       ), bucket_2 AS (
+         SELECT domain, radar_rank, updated_at
+         FROM eligible
+         WHERE radar_rank BETWEEN 1001 AND 10000
+         ORDER BY radar_rank ASC, updated_at ASC, domain ASC
+         LIMIT $4
+       ), bucket_3 AS (
+         SELECT domain, radar_rank, updated_at
+         FROM eligible
+         WHERE radar_rank BETWEEN 10001 AND 100000
+         ORDER BY radar_rank ASC, updated_at ASC, domain ASC
+         LIMIT $5
+       ), bucket_4 AS (
+         SELECT domain, radar_rank, updated_at
+         FROM eligible
+         WHERE radar_rank BETWEEN 100001 AND 1000000
+         ORDER BY radar_rank ASC, updated_at ASC, domain ASC
+         LIMIT $6
+       ), stratified AS (
+         SELECT domain, radar_rank, updated_at FROM bucket_1
+         UNION ALL
+         SELECT domain, radar_rank, updated_at FROM bucket_2
+         UNION ALL
+         SELECT domain, radar_rank, updated_at FROM bucket_3
+         UNION ALL
+         SELECT domain, radar_rank, updated_at FROM bucket_4
+       ), backfill AS (
+         SELECT eligible.domain, eligible.radar_rank, eligible.updated_at
+         FROM eligible
+         WHERE NOT EXISTS (
+           SELECT 1
+           FROM stratified
+           WHERE stratified.domain = eligible.domain
          )
-       ORDER BY ct.radar_rank ASC NULLS LAST, ct.priority DESC, ct.updated_at ASC
+         ORDER BY eligible.radar_rank ASC, eligible.updated_at ASC, eligible.domain ASC
+         LIMIT (SELECT GREATEST($1::bigint - COUNT(*), 0) FROM stratified)
+       ), selected AS (
+         SELECT domain, radar_rank, updated_at FROM stratified
+         UNION ALL
+         SELECT domain, radar_rank, updated_at FROM backfill
+       )
+       SELECT domain, radar_rank
+       FROM selected
+       ORDER BY radar_rank ASC, updated_at ASC, domain ASC
        LIMIT $1`,
-      [safeLimit, maxSnapshotAgeDays],
+      [safeLimit, maxSnapshotAgeDays, ...bucketQuotas],
     );
 
     return result.rows.map((row) => ({
       domain: row.domain,
-      radarRank: row.radar_rank ?? undefined,
+      radarRank: row.radar_rank,
     }));
   }
 

@@ -6,13 +6,12 @@ import type { SiteReport } from '../core/types.js';
 import type { CrawlTargetRepository, JobRepository, SiteRepository } from '../storage/interfaces.js';
 import type { Orchestrator } from '../core/orchestrator.js';
 import { fetchWithRetry } from '../providers/http.js';
+import { SIMILARWEB_SEED_MAX_BATCH_SIZE } from '../lib/similarweb-seed.js';
 import { z } from 'zod';
 
 const HOUR_MS = 3_600_000;
 const MONTHLY_TRAFFIC_RADAR_RANK_LIMIT = 100_000;
 const REDIS_SEED_HARD_STOP_RATIO = 0.85;
-// The SimilarWeb service caps /collect at 50 domains per request.
-const SIMILARWEB_COLLECT_REQUEST_LIMIT = 50;
 const DEFAULT_SIMILARWEB_FOLLOWUP_INITIAL_DELAY_MS = 15 * 60 * 1000;
 const DEFAULT_SIMILARWEB_FOLLOWUP_POLL_INTERVAL_MS = 5 * 60 * 1000;
 const DEFAULT_SIMILARWEB_FOLLOWUP_MAX_WAIT_MS = 45 * 60 * 1000;
@@ -375,9 +374,10 @@ export class TrafficWorker {
       return;
     }
 
+    const requestedBatchSize = Number.isFinite(config.batchSize) ? Math.trunc(config.batchSize) : 1;
     const safeBatchSize = Math.max(
       1,
-      Math.min(SIMILARWEB_COLLECT_REQUEST_LIMIT, Math.trunc(config.batchSize)),
+      Math.min(SIMILARWEB_SEED_MAX_BATCH_SIZE, requestedBatchSize),
     );
     const candidates = await this.crawlTargets.getSimilarwebCollectSeedDomains(safeBatchSize, {
       maxSnapshotAgeDays: config.maxSnapshotAgeDays,

@@ -22,6 +22,7 @@ import type {
   SiteUpsertOptions,
   TrafficRefreshOptions,
 } from './interfaces.js';
+import { selectSimilarwebSeedCandidates } from '../lib/similarweb-seed.js';
 import { mergeSiteReports, sanitizeSiteReport } from '../services/report-merge.js';
 import { calculateLegitimacyScore, withCalculatedLegitimacyScore } from '../scoring/legitimacy.js';
 import { normalizeDirectoryList, normalizeDirectorySlug } from './directory-slug.js';
@@ -1011,13 +1012,15 @@ export class InMemoryCrawlTargetRepository implements CrawlTargetRepository {
     limit: number,
     options?: { maxSnapshotAgeDays?: number },
   ): Promise<Array<{ domain: string; radarRank?: number }>> {
-    const safeLimit = Math.max(1, Math.min(50, Math.trunc(limit)));
     const maxSnapshotAgeDays = Math.max(1, Math.trunc(options?.maxSnapshotAgeDays ?? 30));
     const maxAgeMs = maxSnapshotAgeDays * 86_400_000;
     const nowMs = Date.now();
 
-    return Array.from(this.targets.values())
+    const candidates = Array.from(this.targets.values())
       .filter((target) => isDue(target.nextTrafficAt))
+      .filter((target): target is CrawlTarget & { radarRank: number } => (
+        typeof target.radarRank === 'number'
+      ))
       .filter((target) => {
         if (!target.lastTrafficAt) {
           return true;
@@ -1025,16 +1028,14 @@ export class InMemoryCrawlTargetRepository implements CrawlTargetRepository {
         const lastTrafficAtMs = new Date(target.lastTrafficAt).getTime();
         return !Number.isFinite(lastTrafficAtMs) || (nowMs - lastTrafficAtMs) >= maxAgeMs;
       })
-      .sort((left, right) => {
-        const leftRank = left.radarRank ?? Number.POSITIVE_INFINITY;
-        const rightRank = right.radarRank ?? Number.POSITIVE_INFINITY;
-        if (leftRank !== rightRank) {
-          return leftRank - rightRank;
-        }
-        return right.priority - left.priority;
-      })
-      .slice(0, safeLimit)
-      .map((target) => ({ domain: target.domain, radarRank: target.radarRank }));
+      .map((target) => ({
+        domain: target.domain,
+        radarRank: target.radarRank,
+        updatedAt: target.updatedAt,
+      }));
+
+    return selectSimilarwebSeedCandidates(candidates, limit)
+      .map(({ domain, radarRank }) => ({ domain, radarRank }));
   }
 
   async getHighRankFirstRunDomains(

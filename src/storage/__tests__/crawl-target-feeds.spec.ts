@@ -1,10 +1,20 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('pg', () => ({
+  Pool: class {},
+}));
+
 import { InMemoryCrawlTargetRepository } from '../in-memory.js';
+import { PostgresCrawlTargetRepository } from '../postgres.js';
 
 const hoursAgo = (hours: number): string => new Date(Date.now() - hours * 3600_000).toISOString();
 const hoursFromNow = (hours: number): string => new Date(Date.now() + hours * 3600_000).toISOString();
 
 describe('CrawlTarget feed selectors', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it('selects only high-rank first-run domains for ingest auto-feed', async () => {
     const repo = new InMemoryCrawlTargetRepository();
 
@@ -208,25 +218,101 @@ describe('CrawlTarget feed selectors', () => {
     });
   });
 
-  it('seeds SimilarWeb by ascending Radar rank and caps each batch at 50', async () => {
+  it('stratifies a full SimilarWeb seed across Radar rank cohorts', async () => {
     const repo = new InMemoryCrawlTargetRepository();
-    const targets = Array.from({ length: 55 }, (_, index) => {
-      const radarRank = 55 - index;
-      return {
-        domain: `rank-${String(radarRank).padStart(2, '0')}.example`,
-        radarRank,
-        priority: 1,
-        isHighValue: radarRank <= 10,
-      };
-    });
-    await repo.bulkUpsert(targets);
+    await repo.bulkUpsert([
+      ...[1, 2, 3].map((radarRank) => ({ domain: `top-${radarRank}.example`, radarRank })),
+      ...[1_001, 1_002, 1_003, 1_004].map((radarRank) => ({ domain: `upper-${radarRank}.example`, radarRank })),
+      ...[10_001, 10_002, 10_003, 10_004].map((radarRank) => ({ domain: `mid-${radarRank}.example`, radarRank })),
+      ...[100_001, 100_002, 100_003].map((radarRank) => ({ domain: `long-${radarRank}.example`, radarRank })),
+      { domain: 'outside-radar.example', radarRank: 1_000_001 },
+    ]);
 
-    const selected = await repo.getSimilarwebCollectSeedDomains(80, {
+    const selected = await repo.getSimilarwebCollectSeedDomains(10, {
       maxSnapshotAgeDays: 30,
     });
 
-    expect(selected).toHaveLength(50);
-    expect(selected[0]).toEqual({ domain: 'rank-01.example', radarRank: 1 });
-    expect(selected[49]).toEqual({ domain: 'rank-50.example', radarRank: 50 });
+    expect(selected.map((item) => item.radarRank)).toEqual([
+      1,
+      2,
+      1_001,
+      1_002,
+      1_003,
+      10_001,
+      10_002,
+      10_003,
+      100_001,
+      100_002,
+    ]);
+  });
+
+  it('backfills an undersupplied cohort by global Radar rank without excluding hard domains', async () => {
+    const repo = new InMemoryCrawlTargetRepository();
+    await repo.bulkUpsert([
+      { domain: 'hard-top.example', radarRank: 1 },
+      ...[1_001, 1_002, 1_003, 1_004, 1_005].map((radarRank) => ({ domain: `upper-${radarRank}.example`, radarRank })),
+      ...[10_001, 10_002, 10_003].map((radarRank) => ({ domain: `mid-${radarRank}.example`, radarRank })),
+      ...[100_001, 100_002].map((radarRank) => ({ domain: `long-${radarRank}.example`, radarRank })),
+    ]);
+    await repo.update('hard-top.example', { errorCount: 99 });
+
+    const selected = await repo.getSimilarwebCollectSeedDomains(10, {
+      maxSnapshotAgeDays: 30,
+    });
+
+    expect(selected.map((item) => item.radarRank)).toEqual([
+      1,
+      1_001,
+      1_002,
+      1_003,
+      1_004,
+      10_001,
+      10_002,
+      10_003,
+      100_001,
+      100_002,
+    ]);
+    expect(selected.map((item) => item.domain)).toContain('hard-top.example');
+  });
+
+  it('uses update age and domain as deterministic tie-breakers inside a cohort', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-08-19T00:00:00.000Z'));
+    const repo = new InMemoryCrawlTargetRepository();
+    await repo.bulkUpsert([
+      { domain: 'old-z.example', radarRank: 10 },
+      { domain: 'old-y.example', radarRank: 10 },
+    ]);
+
+    vi.setSystemTime(new Date('2026-08-19T01:00:00.000Z'));
+    await repo.bulkUpsert([
+      { domain: 'new-a.example', radarRank: 10 },
+      ...[1_001, 1_002, 1_003].map((radarRank) => ({ domain: `upper-${radarRank}.example`, radarRank })),
+      ...[10_001, 10_002, 10_003].map((radarRank) => ({ domain: `mid-${radarRank}.example`, radarRank })),
+      ...[100_001, 100_002].map((radarRank) => ({ domain: `long-${radarRank}.example`, radarRank })),
+    ]);
+
+    const selected = await repo.getSimilarwebCollectSeedDomains(10);
+    const selectedDomains = selected.map((item) => item.domain);
+
+    expect(selectedDomains).toContain('old-y.example');
+    expect(selectedDomains).toContain('old-z.example');
+    expect(selectedDomains).not.toContain('new-a.example');
+  });
+
+  it('keeps the production selector profile-gated, stratified, and capped at ten', async () => {
+    const query = vi.fn().mockResolvedValue({ rows: [] });
+    const repo = new PostgresCrawlTargetRepository({ query } as any);
+
+    await repo.getSimilarwebCollectSeedDomains(80, { maxSnapshotAgeDays: 30 });
+
+    expect(query).toHaveBeenCalledTimes(1);
+    const [sql, params] = query.mock.calls[0];
+    expect(String(sql)).toContain('INNER JOIN site_profiles');
+    expect(String(sql)).toContain('eligible AS NOT MATERIALIZED');
+    expect(String(sql)).toContain('radar_rank BETWEEN 100001 AND 1000000');
+    expect(String(sql)).toContain('ct.radar_rank BETWEEN 1 AND 1000000');
+    expect(String(sql)).not.toContain('error_count');
+    expect(params).toEqual([10, 30, 2, 3, 3, 2]);
   });
 });
