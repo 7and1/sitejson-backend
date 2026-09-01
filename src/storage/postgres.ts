@@ -3130,6 +3130,20 @@ export const ensurePostgresSchema = async (pool: Pool): Promise<void> => {
       WHERE radar_rank IS NOT NULL;
   `);
 
+  // Covering index for getSimilarwebCollectSeedDomains. The hourly seed walks
+  // ranks in order, filtering out fresh rows; once the fresh-coverage frontier
+  // passed rank ~45k that walk exceeded the pool's 30s statement timeout and
+  // whole hours stopped seeding (burn-in round 3 NO_GO, 2026-08-31). The key
+  // matches the query's ORDER BY, and INCLUDE carries the two filter columns
+  // so the walk stays inside the index. Applied to production with CREATE
+  // INDEX CONCURRENTLY on 2026-09-01 (36s -> 0.7s warm).
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_crawl_targets_similarweb_seed
+      ON crawl_targets (radar_rank ASC, updated_at ASC, domain ASC)
+      INCLUDE (next_traffic_at, last_traffic_at)
+      WHERE radar_rank IS NOT NULL;
+  `);
+
   await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_crawl_targets_priority_updated
       ON crawl_targets (priority DESC, updated_at ASC);
