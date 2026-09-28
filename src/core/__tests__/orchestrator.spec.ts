@@ -629,6 +629,64 @@ describe('Orchestrator', () => {
     );
   }, 15000);
 
+  it.each([
+    ['succeeds', async () => ({ status: () => 200 })],
+    ['fails', async () => { throw new Error('page.goto: Timeout 100ms exceeded'); }],
+  ])('closes a DNS-pinned browser instead of releasing it into the pool when navigation %s', async (_label, goto) => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(null, {
+        status: 200,
+        headers: { 'content-type': 'text/html' },
+      }),
+    );
+
+    const page = {
+      route: vi.fn(async () => undefined),
+      goto: vi.fn(goto),
+      waitForLoadState: vi.fn(async () => undefined),
+      screenshot: vi.fn(async () => Buffer.from('png')),
+      content: vi.fn(async () => '<html><head><title>Example</title></head><body><h1>Example</h1></body></html>'),
+      url: vi.fn(() => 'https://example.com'),
+      close: vi.fn(async () => undefined),
+    };
+    const context = {
+      newPage: vi.fn(async () => page),
+      close: vi.fn(async () => undefined),
+    };
+    const browser = {
+      newContext: vi.fn(async () => context),
+      close: vi.fn(async () => undefined),
+      isConnected: vi.fn(() => true),
+    };
+    mockChromiumLaunch.mockResolvedValue(browser as any);
+    const pool = {
+      acquire: vi.fn(),
+      release: vi.fn(),
+    };
+
+    const orchestrator = new Orchestrator(
+      [
+        new MetaProvider(providerOptions, 'SiteJSONTest/1.0'),
+        new SeoProvider(providerOptions, 'SiteJSONTest/1.0'),
+      ],
+      createLogger('error'),
+      {
+        ...runtimeOptions,
+        browserEnabled: true,
+      },
+    );
+    orchestrator.setBrowserPool(pool as any);
+
+    await orchestrator.analyze('example.com', 'trc_browser_pin_pool', {
+      phase: 'browser',
+    });
+
+    expect(mockChromiumLaunch).toHaveBeenCalledTimes(1);
+    expect(pool.acquire).not.toHaveBeenCalled();
+    expect(pool.release).not.toHaveBeenCalled();
+    expect(browser.close).toHaveBeenCalledTimes(1);
+  }, 15000);
+
   it('treats browser challenge pages as blocked content instead of real page data', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response(null, {

@@ -266,6 +266,15 @@ export const shouldAllowBrowserRequestUrl = async (
   return verdict;
 };
 
+type BrowserResources = {
+  browser: Browser | null;
+  // True only when `browser` came from the pool. A privately launched browser (DNS pin,
+  // no pool) must be closed; releasing it would grow the pool by one per job.
+  pooled: boolean;
+  context: PlaywrightBrowserContext | null;
+  page: Page | null;
+};
+
 export class Orchestrator {
   private browserPool?: BrowserPool;
 
@@ -277,6 +286,22 @@ export class Orchestrator {
 
   setBrowserPool(pool: BrowserPool): void {
     this.browserPool = pool;
+  }
+
+  private async disposeBrowserResources(resources: BrowserResources): Promise<void> {
+    try { await resources.page?.close(); } catch { /* noop */ }
+    try { await resources.context?.close(); } catch { /* noop */ }
+    if (resources.browser) {
+      if (resources.pooled && this.browserPool) {
+        this.browserPool.release(resources.browser);
+      } else {
+        try { await resources.browser.close(); } catch { /* noop */ }
+      }
+    }
+    resources.page = null;
+    resources.context = null;
+    resources.browser = null;
+    resources.pooled = false;
   }
 
   async analyze(domain: string, traceId: string, options?: AnalyzeOptions): Promise<SiteReport> {
@@ -338,8 +363,9 @@ export class Orchestrator {
     // Async and traffic phases skip browser entirely
     const needsBrowser = !options?.aiReclassify && (phase === 'browser' || !phase);
 
-    const browserResources: { browser: Browser | null; context: PlaywrightBrowserContext | null; page: Page | null } = {
+    const browserResources: BrowserResources = {
       browser: null,
+      pooled: false,
       context: null,
       page: null,
     };
@@ -424,10 +450,11 @@ export class Orchestrator {
                 headless: true,
                 args: [`--host-resolver-rules=${pinnedResolverRules}`],
               });
+            } else if (this.browserPool) {
+              browserResources.browser = await this.browserPool.acquire();
+              browserResources.pooled = true;
             } else {
-              browserResources.browser = this.browserPool
-                ? await this.browserPool.acquire()
-                : await chromium.launch({ headless: true });
+              browserResources.browser = await chromium.launch({ headless: true });
             }
             browserResources.context = await browserResources.browser.newContext({
               viewport: this.providerRuntime.browserViewport,
@@ -499,16 +526,7 @@ export class Orchestrator {
             const finalUrl = browserResources.page.url();
 
             // Close page + context IMMEDIATELY — release resources before running providers
-            try { await browserResources.page.close(); } catch { /* noop */ }
-            try { await browserResources.context.close(); } catch { /* noop */ }
-            if (this.browserPool) {
-              this.browserPool.release(browserResources.browser);
-            } else {
-              try { await browserResources.browser.close(); } catch { /* noop */ }
-            }
-            browserResources.page = null;
-            browserResources.context = null;
-            browserResources.browser = null;
+            await this.disposeBrowserResources(browserResources);
 
             context.url = finalUrl;
             const blocked = !applySafeHtmlToContext(context, {
@@ -554,16 +572,7 @@ export class Orchestrator {
             fetchTrace.push(buildFetchTraceEntry('browser', 'direct', browserAttemptStartedAt, error));
 
             // Ensure browser is cleaned up on failure
-            try { await browserResources.page?.close(); } catch { /* noop */ }
-            try { await browserResources.context?.close(); } catch { /* noop */ }
-            if (this.browserPool && browserResources.browser) {
-              this.browserPool.release(browserResources.browser);
-            } else {
-              try { await browserResources.browser?.close(); } catch { /* noop */ }
-            }
-            browserResources.page = null;
-            browserResources.context = null;
-            browserResources.browser = null;
+            await this.disposeBrowserResources(browserResources);
           }
         }
 
@@ -726,13 +735,7 @@ export class Orchestrator {
       return report;
     } finally {
       // Safety net: clean up browser if still open (e.g. non-browser phase or unexpected error)
-      try { await browserResources.page?.close(); } catch { /* noop */ }
-      try { await browserResources.context?.close(); } catch { /* noop */ }
-      if (this.browserPool && browserResources.browser) {
-        this.browserPool.release(browserResources.browser);
-      } else {
-        try { await browserResources.browser?.close(); } catch { /* noop */ }
-      }
+      await this.disposeBrowserResources(browserResources);
     }
   }
 
