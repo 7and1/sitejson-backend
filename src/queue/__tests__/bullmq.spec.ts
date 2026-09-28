@@ -5,6 +5,7 @@ import { QUEUE_NAMES } from '../names.js';
 
 const queueAddSpy = vi.hoisted(() => vi.fn());
 const queueAddBulkSpy = vi.hoisted(() => vi.fn());
+const workerProcessors = vi.hoisted(() => [] as Array<(job: { id: string; data: unknown }) => Promise<unknown>>);
 
 vi.mock('bullmq', () => ({
   Queue: class {
@@ -13,7 +14,11 @@ vi.mock('bullmq', () => ({
     close = vi.fn(async () => {});
     getJobCounts = vi.fn(async () => ({}));
   },
-  Worker: class {},
+  Worker: class {
+    constructor(_name: string, processor: (job: { id: string; data: unknown }) => Promise<unknown>) {
+      workerProcessors.push(processor);
+    }
+  },
 }));
 
 describe('parseRedisUrl', () => {
@@ -78,6 +83,37 @@ describe('getJobOptionsForQueue', () => {
     const options = getJobOptionsForQueue(QUEUE_NAMES.async);
 
     expect(options.removeOnFail).toEqual({ age: 43_200, count: 200 });
+  });
+});
+
+describe('BullMqJobQueue active job tracking', () => {
+  const payload = { jobId: 'job-42', domain: 'example.com', traceId: 'trc-42', phase: QUEUE_NAMES.browser };
+
+  it('reports a job as active only while its handler runs', async () => {
+    const queue = new BullMqJobQueue({ host: 'redis', port: 6379 }, 'sitejson', {}, 1);
+    let finish!: () => void;
+    await queue.consume(QUEUE_NAMES.browser, () => new Promise<void>((resolve) => (finish = resolve)));
+    const processor = workerProcessors.at(-1)!;
+
+    const run = processor({ id: '42', data: payload });
+    expect(queue.getActiveJobs()).toEqual([
+      expect.objectContaining({ queueName: QUEUE_NAMES.browser, jobId: '42', startedAt: expect.any(Number) }),
+    ]);
+
+    finish();
+    await run;
+    expect(queue.getActiveJobs()).toEqual([]);
+  });
+
+  it('stops tracking a job whose handler throws', async () => {
+    const queue = new BullMqJobQueue({ host: 'redis', port: 6379 }, 'sitejson', {}, 1);
+    await queue.consume(QUEUE_NAMES.async, async () => {
+      throw new Error('provider failed');
+    });
+    const processor = workerProcessors.at(-1)!;
+
+    await expect(processor({ id: '7', data: { ...payload, phase: QUEUE_NAMES.async } })).rejects.toThrow('provider failed');
+    expect(queue.getActiveJobs()).toEqual([]);
   });
 });
 

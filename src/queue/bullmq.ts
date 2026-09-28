@@ -1,5 +1,6 @@
 import { Queue, Worker, type JobsOptions, type Processor, type WorkerOptions } from 'bullmq';
 import type {
+  ActiveJob,
   JobQueue,
   QueueCountsMap,
   QueueJobPayload,
@@ -122,6 +123,7 @@ export const buildRepeatableJobId = (
 export class BullMqJobQueue implements JobQueue {
   private readonly queues = new Map<QueueName, Queue<QueueJobPayload>>();
   private readonly workers = new Map<QueueName, Worker<QueueJobPayload>>();
+  private readonly activeJobs = new Map<string, ActiveJob>();
   private readonly concurrencyMap: Partial<Record<QueueName, number>>;
   private readonly defaultConcurrency: number;
 
@@ -237,7 +239,13 @@ export class BullMqJobQueue implements JobQueue {
     const concurrency = this.concurrencyMap[queueName] ?? this.defaultConcurrency;
 
     const processor: Processor<QueueJobPayload> = async (job) => {
-      await handler(job.data);
+      const key = `${queueName}:${job.id}`;
+      this.activeJobs.set(key, { queueName, jobId: String(job.id), startedAt: Date.now() });
+      try {
+        await handler(job.data);
+      } finally {
+        this.activeJobs.delete(key);
+      }
       return null;
     };
 
@@ -248,6 +256,10 @@ export class BullMqJobQueue implements JobQueue {
       ...queueWorkerOpts,
     });
     this.workers.set(queueName, worker);
+  }
+
+  getActiveJobs(): ActiveJob[] {
+    return [...this.activeJobs.values()];
   }
 
   async getCounts(queueName: QueueName = DEFAULT_QUEUE_NAME) {

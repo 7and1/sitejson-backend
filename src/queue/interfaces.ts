@@ -64,6 +64,12 @@ export interface RepeatableJobOptions {
   purpose: QueueJobPayload['purpose'];
 }
 
+export interface ActiveJob {
+  queueName: QueueName;
+  jobId: string;
+  startedAt: number;
+}
+
 export interface JobQueue {
   enqueue(payload: QueueJobPayload, queueName?: QueueName): Promise<void>;
   enqueueBulk(payloads: QueueJobPayload[], queueName: QueueName): Promise<void>;
@@ -75,5 +81,7 @@ export interface JobQueue {
   getRedisMemorySnapshot(): Promise<RedisMemorySnapshot | null>;
   retryFailed(queueName: QueueName, limit: number): Promise<number>;
   healthCheck(): Promise<boolean>;
+  /** Jobs this process is executing right now (worker liveness). */
+  getActiveJobs?(): ActiveJob[];
   close?(): Promise<void>;
 }

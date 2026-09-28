@@ -1,6 +1,4 @@
 import { buildApp } from './app.js';
-import { mkdir, writeFile } from 'node:fs/promises';
-import { dirname } from 'node:path';
 import { IngestWorker } from './workers/ingest-worker.js';
 import { BrowserWorker } from './workers/browser-worker.js';
 import { AsyncWorker } from './workers/async-worker.js';
@@ -11,9 +9,7 @@ import { setupScheduledJobs } from './workers/scheduler.js';
 import { BrowserPool } from './core/browser-pool.js';
 import type { QueueName } from './queue/names.js';
 import { ALL_QUEUE_NAMES, QUEUE_NAMES } from './queue/names.js';
-import type { Logger } from './observability/logger.js';
-
-const HEARTBEAT_INTERVAL_MS = 10_000;
+import { startHeartbeat } from './workers/liveness.js';
 
 const parseWorkerQueues = (raw?: string): Set<QueueName> | null => {
   if (!raw?.trim()) return null; // all queues
@@ -34,36 +30,6 @@ const parseWorkerQueues = (raw?: string): Set<QueueName> | null => {
     console.warn(`WORKER_QUEUES: ignoring invalid names: ${invalid.join(', ')}`);
   }
   return valid.size > 0 ? valid : null;
-};
-
-const startHeartbeat = (
-  filePath: string | undefined,
-  logger: Logger,
-): ReturnType<typeof setInterval> | null => {
-  if (!filePath) {
-    return null;
-  }
-
-  const writeHeartbeat = async () => {
-    try {
-      await mkdir(dirname(filePath), { recursive: true });
-      await writeFile(filePath, `${new Date().toISOString()}\n`, { mode: 0o644 });
-    } catch (error) {
-      logger.warn({
-        module: 'worker',
-        event: 'heartbeat_write_failed',
-        file: filePath,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
-  };
-
-  void writeHeartbeat();
-  const timer = setInterval(() => {
-    void writeHeartbeat();
-  }, HEARTBEAT_INTERVAL_MS);
-  timer.unref();
-  return timer;
 };
 
 const startWorker = async () => {
@@ -248,9 +214,9 @@ const startWorker = async () => {
 
   const activeQueues = allowedQueues ? [...allowedQueues].join(',') : 'all';
   runtime.logger.info({ module: 'worker', event: 'started', queues: activeQueues, browserPool: !!browserPool });
-  const heartbeatTimer = startHeartbeat(runtime.env.WORKER_HEARTBEAT_FILE, runtime.logger);
 
   // --- Graceful shutdown ---
+  let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
   let isShuttingDown = false;
   const shutdown = async (signal: string) => {
     if (isShuttingDown) return;
@@ -289,6 +255,16 @@ const startWorker = async () => {
 
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+  // A wedged job never finishes, so shutdown ends via its force-exit timer and
+  // `restart: unless-stopped` brings the worker back; BullMQ re-queues the job
+  // once its lock expires (and fails it after maxStalledCount).
+  heartbeatTimer = startHeartbeat(
+    runtime.env.WORKER_HEARTBEAT_FILE,
+    runtime.logger,
+    () => runtime.dependencies.queue.getActiveJobs?.() ?? [],
+    () => { void shutdown('stuck_job'); },
+  );
 
   // --- Crash safety ---
   process.on('uncaughtException', (err) => {
