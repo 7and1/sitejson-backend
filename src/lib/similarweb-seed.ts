@@ -1,5 +1,11 @@
 export const SIMILARWEB_SEED_MAX_BATCH_SIZE = 10;
 export const SIMILARWEB_SEED_MAX_RADAR_RANK = 1_000_000;
+// A domain whose latest SimilarWeb outcome is `blocked` is retried after
+// 7, 14, then 28 days (base * 2^(blocks-1)), ahead of the regular seed and
+// regardless of its traffic cooldown; after the third retry it falls back to
+// the regular 30-day selection.
+export const SIMILARWEB_BLOCKED_RETRY_BASE_DAYS = 7;
+export const SIMILARWEB_BLOCKED_MAX_RETRIES = 3;
 
 type SimilarwebSeedCandidate = {
   domain: string;

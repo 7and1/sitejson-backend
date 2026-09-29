@@ -168,6 +168,9 @@ export interface CrawlTargetRepository {
     limit: number,
     options?: { maxSnapshotAgeDays?: number },
   ): Promise<Array<{ domain: string; radarRank?: number }>>;
+  getSimilarwebBlockedRetries(
+    limit: number,
+  ): Promise<Array<{ domain: string; radarRank?: number }>>;
   getHighRankFirstRunDomains(
     limit: number,
     options?: { maxRadarRank?: number },

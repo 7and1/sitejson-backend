@@ -379,10 +379,17 @@ export class TrafficWorker {
       1,
       Math.min(SIMILARWEB_SEED_MAX_BATCH_SIZE, requestedBatchSize),
     );
-    const candidates = await this.crawlTargets.getSimilarwebCollectSeedDomains(safeBatchSize, {
-      maxSnapshotAgeDays: config.maxSnapshotAgeDays,
-    });
-    const domains = candidates.map((item) => item.domain);
+    // Due blocked retries go first; regular candidates fill the rest of the batch.
+    const blockedRetries = await this.crawlTargets.getSimilarwebBlockedRetries(safeBatchSize);
+    const regularSlots = safeBatchSize - blockedRetries.length;
+    const candidates = regularSlots > 0
+      ? await this.crawlTargets.getSimilarwebCollectSeedDomains(regularSlots, {
+        maxSnapshotAgeDays: config.maxSnapshotAgeDays,
+      })
+      : [];
+    const domains = [...new Set(
+      [...blockedRetries, ...candidates].map((item) => item.domain),
+    )].slice(0, safeBatchSize);
 
     if (domains.length === 0) {
       this.logger.debug({
@@ -513,6 +520,7 @@ export class TrafficWorker {
       module: 'traffic-worker',
       event: 'similarweb_collect_seed_completed',
       count: domains.length,
+      blocked_retry_count: blockedRetries.length,
       first_domain: domains[0],
       last_domain: domains[domains.length - 1],
       response_status: responseStatus,

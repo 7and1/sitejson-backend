@@ -1038,6 +1038,13 @@ export class InMemoryCrawlTargetRepository implements CrawlTargetRepository {
       .map(({ domain, radarRank }) => ({ domain, radarRank }));
   }
 
+  // The SimilarWeb service's queue lives only in Postgres; nothing is blocked here.
+  async getSimilarwebBlockedRetries(
+    _limit: number,
+  ): Promise<Array<{ domain: string; radarRank?: number }>> {
+    return [];
+  }
+
   async getHighRankFirstRunDomains(
     limit: number,
     options?: { maxRadarRank?: number },

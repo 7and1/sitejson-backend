@@ -314,5 +314,34 @@ describe('CrawlTarget feed selectors', () => {
     expect(String(sql)).toContain('ct.radar_rank BETWEEN 1 AND 1000000');
     expect(String(sql)).not.toContain('error_count');
     expect(params).toEqual([10, 30, 2, 3, 3, 2]);
+    expect(String(sql)).not.toContain('similarweb_api');
+  });
+
+  it('selects blocked retries from the SimilarWeb queue on a 7/14/28-day backoff', async () => {
+    const query = vi.fn().mockResolvedValue({ rows: [{ domain: 'blocked.example', radar_rank: 42 }] });
+    const repo = new PostgresCrawlTargetRepository({ query } as any);
+
+    const selected = await repo.getSimilarwebBlockedRetries(80);
+
+    expect(selected).toEqual([{ domain: 'blocked.example', radarRank: 42 }]);
+    const [sql, params] = query.mock.calls[0];
+    const text = String(sql);
+    expect(text).toContain('FROM similarweb_api.collection_queue');
+    expect(text).toContain("failure_kind = 'blocked'");
+    // Only domains whose latest outcome is still a block, never no_data verdicts.
+    expect(text).toContain('DISTINCT ON (q.domain)');
+    expect(text).toContain("l.status = 'failed'");
+    expect(text).toContain('b.blocks <= $2');
+    expect(text).toContain('make_interval(days => $3 * (2 ^ (b.blocks - 1))::int)');
+    expect(text).toContain('INNER JOIN site_profiles');
+    expect(text).toContain('ct.radar_rank BETWEEN 1 AND 1000000');
+    expect(params).toEqual([10, 3, 7]);
+  });
+
+  it('has no blocked retries without the SimilarWeb Postgres queue', async () => {
+    const repo = new InMemoryCrawlTargetRepository();
+    await repo.bulkUpsert([{ domain: 'a.example', radarRank: 5, priority: 1, isHighValue: false }]);
+
+    expect(await repo.getSimilarwebBlockedRetries(10)).toEqual([]);
   });
 });

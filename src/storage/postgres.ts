@@ -27,7 +27,10 @@ import type {
 } from './interfaces.js';
 import {
   getSimilarwebSeedBucketQuotas,
+  SIMILARWEB_BLOCKED_MAX_RETRIES,
+  SIMILARWEB_BLOCKED_RETRY_BASE_DAYS,
   SIMILARWEB_SEED_MAX_BATCH_SIZE,
+  SIMILARWEB_SEED_MAX_RADAR_RANK,
 } from '../lib/similarweb-seed.js';
 import type { Logger } from '../observability/logger.js';
 import { mergeSiteReports, sanitizeSiteReport } from '../services/report-merge.js';
@@ -2526,6 +2529,46 @@ export class PostgresCrawlTargetRepository implements CrawlTargetRepository {
        ORDER BY radar_rank ASC, updated_at ASC, domain ASC
        LIMIT $1`,
       [safeLimit, maxSnapshotAgeDays, ...bucketQuotas],
+    );
+
+    return result.rows.map((row) => ({
+      domain: row.domain,
+      radarRank: row.radar_rank,
+    }));
+  }
+
+  // Reads the SimilarWeb service's own queue (schema `similarweb_api`, same
+  // database and role): the backend never learns the failure kind otherwise,
+  // and only `blocked` deserves an early retry — `no_data` is a verdict.
+  async getSimilarwebBlockedRetries(
+    limit: number,
+  ): Promise<Array<{ domain: string; radarRank?: number }>> {
+    const safeLimit = Math.max(1, Math.min(SIMILARWEB_SEED_MAX_BATCH_SIZE, Math.trunc(limit) || 1));
+    const result = await this.pool.query<{ domain: string; radar_rank: number }>(
+      `WITH blocked AS (
+         SELECT domain, COUNT(*)::int AS blocks
+         FROM similarweb_api.collection_queue
+         WHERE status = 'failed' AND failure_kind = 'blocked'
+         GROUP BY domain
+       ), latest AS (
+         SELECT DISTINCT ON (q.domain) q.domain, q.status, q.failure_kind, q.completed_at
+         FROM similarweb_api.collection_queue q
+         INNER JOIN blocked b ON b.domain = q.domain
+         ORDER BY q.domain, q.created_at DESC, q.id DESC
+       )
+       SELECT l.domain, ct.radar_rank
+       FROM latest l
+       INNER JOIN blocked b ON b.domain = l.domain
+       INNER JOIN crawl_targets ct ON ct.domain = l.domain
+       INNER JOIN site_profiles sp ON sp.domain = l.domain
+       WHERE l.status = 'failed'
+         AND l.failure_kind = 'blocked'
+         AND b.blocks <= $2
+         AND l.completed_at <= NOW() - make_interval(days => $3 * (2 ^ (b.blocks - 1))::int)
+         AND ct.radar_rank BETWEEN 1 AND ${SIMILARWEB_SEED_MAX_RADAR_RANK}
+       ORDER BY l.completed_at ASC, l.domain ASC
+       LIMIT $1`,
+      [safeLimit, SIMILARWEB_BLOCKED_MAX_RETRIES, SIMILARWEB_BLOCKED_RETRY_BASE_DAYS],
     );
 
     return result.rows.map((row) => ({

@@ -27,6 +27,7 @@ const makeSimilarwebWorker = (options?: {
   initialDelayMs?: number;
   pollIntervalMs?: number;
   maxWaitMs?: number;
+  blockedRetries?: string[];
 }) => {
   const domains = options?.domains ?? ['example.com'];
   const queue = {
@@ -38,6 +39,9 @@ const makeSimilarwebWorker = (options?: {
     update: vi.fn(),
     getSimilarwebCollectSeedDomains: vi.fn().mockResolvedValue(
       domains.map((domain, index) => ({ domain, radarRank: index + 1 })),
+    ),
+    getSimilarwebBlockedRetries: vi.fn().mockResolvedValue(
+      (options?.blockedRetries ?? []).map((domain) => ({ domain, radarRank: 500 })),
     ),
   };
   const logger = {
@@ -469,6 +473,7 @@ describe('TrafficWorker', () => {
       getByDomain: vi.fn(),
       update: vi.fn(),
       getSimilarwebCollectSeedDomains: vi.fn().mockResolvedValue(ranked),
+      getSimilarwebBlockedRetries: vi.fn().mockResolvedValue([]),
     };
     const jobs = {
       markRunning: vi.fn(),
@@ -615,6 +620,48 @@ describe('TrafficWorker', () => {
     expect(logger.error).toHaveBeenCalledWith(expect.objectContaining({
       event: 'similarweb_collect_seed_invalid_response',
     }));
+  });
+
+  it('seeds due blocked retries first and fills the rest of the batch with regular candidates', async () => {
+    const { worker, crawlTargets, logger } = makeSimilarwebWorker({
+      blockedRetries: ['blocked-a.example', 'blocked-b.example'],
+      domains: ['blocked-b.example', 'regular.example'],
+    });
+    fetchWithRetry.mockResolvedValueOnce(similarwebResponse({
+      data: { total: 3, queued: 0, deduped: 0, failed: 0, results: [] },
+    }, 202));
+
+    await worker.process({
+      jobId: 'seed', domain: '', traceId: 'trc-blocked', phase: 'traffic',
+      purpose: 'traffic-similarweb-collect-seed',
+    });
+
+    expect(crawlTargets.getSimilarwebBlockedRetries).toHaveBeenCalledWith(10);
+    expect(crawlTargets.getSimilarwebCollectSeedDomains).toHaveBeenCalledWith(8, {
+      maxSnapshotAgeDays: 30,
+    });
+    const body = JSON.parse(fetchWithRetry.mock.calls[0][1].requestInit.body as string);
+    expect(body.domains).toEqual(['blocked-a.example', 'blocked-b.example', 'regular.example']);
+    expect(logger.info).toHaveBeenCalledWith(expect.objectContaining({
+      event: 'similarweb_collect_seed_completed',
+      count: 3,
+      blocked_retry_count: 2,
+    }));
+  });
+
+  it('skips the regular selector when blocked retries fill the batch', async () => {
+    const blocked = Array.from({ length: 10 }, (_, index) => `blocked-${index}.example`);
+    const { worker, crawlTargets } = makeSimilarwebWorker({ blockedRetries: blocked });
+    fetchWithRetry.mockResolvedValueOnce(similarwebResponse({ data: { results: [] } }, 202));
+
+    await worker.process({
+      jobId: 'seed', domain: '', traceId: 'trc-full', phase: 'traffic',
+      purpose: 'traffic-similarweb-collect-seed',
+    });
+
+    expect(crawlTargets.getSimilarwebCollectSeedDomains).not.toHaveBeenCalled();
+    const body = JSON.parse(fetchWithRetry.mock.calls[0][1].requestInit.body as string);
+    expect(body.domains).toEqual(blocked);
   });
 
   it('polls pending SimilarWeb jobs every five minutes without calling traffic directly', async () => {
