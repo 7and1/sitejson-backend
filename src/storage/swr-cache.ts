@@ -138,8 +138,13 @@ export class SwrCache<T> {
     void loader().then(
       (value) => this.commit(key, value),
       () => {
+        // Back off for a full TTL: a loader that keeps failing (e.g. hitting the
+        // statement timeout) must not be re-run by every request while stale.
         const entry = this.store.get(key);
-        if (entry) entry.refreshing = false;
+        if (entry) {
+          entry.freshUntil = this.now() + this.ttlMs;
+          entry.refreshing = false;
+        }
       },
     );
   }

@@ -551,6 +551,17 @@ const compareDirectoryItems = (left: DirectoryItem, right: DirectoryItem): numbe
 const DEFAULT_BROWSER_TTL_SEC = 365 * 24 * 3600; // 1 year — browser crawl is one-time
 const DEFAULT_RADAR_TTL_SEC = 7 * 24 * 3600;
 const DEFAULT_ASYNC_TTL_SEC = 30 * 24 * 3600;
+const DIRECTORY_SUMMARY_BASE_LIMIT = 50;
+
+const summarizeDirectorySlugs = (
+  type: DirectoryType,
+  slugs: DirectoryTypeSummary['slugs'],
+): DirectoryTypeSummary => ({
+  type,
+  totalSlugs: slugs.length,
+  totalSites: slugs.reduce((sum, s) => sum + s.count, 0),
+  slugs,
+});
 
 export class PostgresSiteRepository implements SiteRepository {
   private readonly alternativesCache = new Map<string, { result: AlternativeSearchResult; expiresAt: number }>();
@@ -1210,13 +1221,17 @@ export class PostgresSiteRepository implements SiteRepository {
 
   async getDirectoryTypeSummary(type: DirectoryType, limit = 50): Promise<DirectoryTypeSummary> {
     const safeLimit = Math.max(1, Math.min(200, Math.trunc(limit)));
+    // Every limit runs the same full-table aggregation (LIMIT only trims the
+    // output), so limits up to the default share one cached computation.
+    const computeLimit = Math.max(safeLimit, DIRECTORY_SUMMARY_BASE_LIMIT);
     // Facet counts are global and slow-changing; serve stale-while-revalidate so
     // the slow full-scan / unnest aggregation never runs on the request path
     // after the first population (prevents statement-timeout 500s under load).
-    return this.directoryTypeSummaryCache.get(
-      `${type}:${safeLimit}`,
-      () => this.computeDirectoryTypeSummary(type, safeLimit),
+    const summary = await this.directoryTypeSummaryCache.get(
+      `${type}:${computeLimit}`,
+      () => this.computeDirectoryTypeSummary(type, computeLimit),
     );
+    return safeLimit === computeLimit ? summary : summarizeDirectorySlugs(type, summary.slugs.slice(0, safeLimit));
   }
 
   private async computeDirectoryTypeSummary(type: DirectoryType, safeLimit: number): Promise<DirectoryTypeSummary> {
@@ -1236,15 +1251,16 @@ export class PostgresSiteRepository implements SiteRepository {
         top_domains AS (
           SELECT DISTINCT ON (category_text)
             category_text AS slug,
-            domain,
-            COALESCE(report_json->'meta'->>'title', domain) AS title
+            domain
           FROM site_profiles
           WHERE category_text IN (SELECT slug FROM slug_counts)
           ORDER BY category_text, COALESCE(rank_int, traffic_rank_int, 999999999) ASC
         )
-        SELECT sc.slug, sc.count::text, td.domain AS top_domain, td.title AS top_title
+        SELECT sc.slug, sc.count::text, td.domain AS top_domain,
+          COALESCE(sp.report_json->'meta'->>'title', td.domain) AS top_title
         FROM slug_counts sc
         LEFT JOIN top_domains td ON td.slug = sc.slug
+        LEFT JOIN site_profiles sp ON sp.domain = td.domain
         ORDER BY sc.count DESC`;
     } else if (type === 'technology') {
       sql = `
@@ -1259,15 +1275,16 @@ export class PostgresSiteRepository implements SiteRepository {
         top_domains AS (
           SELECT DISTINCT ON (t)
             t AS slug,
-            domain,
-            COALESCE(report_json->'meta'->>'title', domain) AS title
+            domain
           FROM site_profiles, unnest(tech_search) t
           WHERE t IN (SELECT slug FROM slug_counts)
           ORDER BY t, COALESCE(rank_int, traffic_rank_int, 999999999) ASC
         )
-        SELECT sc.slug, sc.count::text, td.domain AS top_domain, td.title AS top_title
+        SELECT sc.slug, sc.count::text, td.domain AS top_domain,
+          COALESCE(sp.report_json->'meta'->>'title', td.domain) AS top_title
         FROM slug_counts sc
         LEFT JOIN top_domains td ON td.slug = sc.slug
+        LEFT JOIN site_profiles sp ON sp.domain = td.domain
         ORDER BY sc.count DESC`;
     } else {
       sql = `
@@ -1282,35 +1299,30 @@ export class PostgresSiteRepository implements SiteRepository {
         top_domains AS (
           SELECT DISTINCT ON (t)
             t AS slug,
-            domain,
-            COALESCE(report_json->'meta'->>'title', domain) AS title
+            domain
           FROM site_profiles, unnest(tags_search) t
           WHERE t IN (SELECT slug FROM slug_counts)
           ORDER BY t, COALESCE(rank_int, traffic_rank_int, 999999999) ASC
         )
-        SELECT sc.slug, sc.count::text, td.domain AS top_domain, td.title AS top_title
+        SELECT sc.slug, sc.count::text, td.domain AS top_domain,
+          COALESCE(sp.report_json->'meta'->>'title', td.domain) AS top_title
         FROM slug_counts sc
         LEFT JOIN top_domains td ON td.slug = sc.slug
+        LEFT JOIN site_profiles sp ON sp.domain = td.domain
         ORDER BY sc.count DESC`;
     }
 
     const result = await this.pool.query<SlugCountRow>(sql, [safeLimit]);
 
-    const slugs = result.rows.map((row) => ({
-      slug: row.slug,
-      count: parseCount(row.count),
-      topDomain: row.top_domain ?? undefined,
-      topTitle: row.top_title ?? undefined,
-    }));
-
-    const totalSites = slugs.reduce((sum, s) => sum + s.count, 0);
-
-    return {
+    return summarizeDirectorySlugs(
       type,
-      totalSlugs: slugs.length,
-      totalSites,
-      slugs,
-    };
+      result.rows.map((row) => ({
+        slug: row.slug,
+        count: parseCount(row.count),
+        topDomain: row.top_domain ?? undefined,
+        topTitle: row.top_title ?? undefined,
+      })),
+    );
   }
 
   async prewarmDirectoryCaches(options?: { topSlugsPerType?: number }): Promise<void> {

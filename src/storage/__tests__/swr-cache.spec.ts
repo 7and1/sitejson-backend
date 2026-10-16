@@ -69,6 +69,36 @@ describe('SwrCache', () => {
     expect(await cache.get('k', loader)).toBe('v1'); // still stale, no throw
   });
 
+  it('backs off for a TTL after a failed background refresh instead of retrying per request', async () => {
+    let now = 1000;
+    let value: string | null = 'v1';
+    const loader = vi.fn(async () => {
+      if (value === null) throw new Error('statement timeout');
+      return value;
+    });
+    const cache = new SwrCache<string>({ ttlMs: 100, now: () => now });
+
+    expect(await cache.get('k', loader)).toBe('v1');
+    now = 2000;
+    value = null;
+    expect(await cache.get('k', loader)).toBe('v1'); // triggers the failing refresh
+    await flush();
+    expect(loader).toHaveBeenCalledTimes(2);
+
+    now = 2050; // within the backoff window: no new attempt
+    expect(await cache.get('k', loader)).toBe('v1');
+    expect(await cache.get('k', loader)).toBe('v1');
+    await flush();
+    expect(loader).toHaveBeenCalledTimes(2);
+
+    now = 2100; // backoff elapsed: retry once
+    value = 'v2';
+    expect(await cache.get('k', loader)).toBe('v1');
+    await flush();
+    expect(loader).toHaveBeenCalledTimes(3);
+    expect(await cache.get('k', loader)).toBe('v2');
+  });
+
   it('evicts the oldest entry past maxEntries', async () => {
     const cache = new SwrCache<string>({ ttlMs: 10_000, maxEntries: 2 });
     await cache.get('a', async () => 'a');
