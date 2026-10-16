@@ -1,4 +1,4 @@
-import { Pool } from 'pg';
+import { Pool, type QueryResult, type QueryResultRow } from 'pg';
 import type {
   AlternativeSearchResult,
   CrawlJob,
@@ -552,6 +552,10 @@ const DEFAULT_BROWSER_TTL_SEC = 365 * 24 * 3600; // 1 year — browser crawl is 
 const DEFAULT_RADAR_TTL_SEC = 7 * 24 * 3600;
 const DEFAULT_ASYNC_TTL_SEC = 30 * 24 * 3600;
 const DIRECTORY_SUMMARY_BASE_LIMIT = 50;
+// Full-table aggregations (facet summaries, global insights) refresh in the
+// background and, under the sitejson-db disk read cap, can outlast the pool's
+// 30s request-path statement timeout; they get their own budget instead.
+const AGGREGATE_STATEMENT_TIMEOUT_MS = 600_000;
 
 const summarizeDirectorySlugs = (
   type: DirectoryType,
@@ -583,7 +587,9 @@ export class PostgresSiteRepository implements SiteRepository {
       persist: redis ? createRedisSwrPersistence<DirectorySearchResult>(redis, 'sj:dir:list', redisTtlSeconds) : undefined,
     });
     this.directoryTypeSummaryCache = new SwrCache<DirectoryTypeSummary>({
-      ttlMs: 600_000,
+      // Global facet counts over ~2.7M sites barely move within an hour; each
+      // refresh reads all of site_profiles, so refresh hourly, not every 10 min.
+      ttlMs: 3_600_000,
       maxEntries: 64,
       persist: redis ? createRedisSwrPersistence<DirectoryTypeSummary>(redis, 'sj:dir:summary', redisTtlSeconds) : undefined,
     });
@@ -597,6 +603,22 @@ export class PostgresSiteRepository implements SiteRepository {
       maxEntries: 1,
       persist: redis ? createRedisSwrPersistence<GlobalInsights>(redis, 'sj:insights', redisTtlSeconds) : undefined,
     });
+  }
+
+  private async queryAggregate<R extends QueryResultRow>(sql: string, params: unknown[] = []): Promise<QueryResult<R>> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('SELECT set_config($1, $2, true)', ['statement_timeout', `${AGGREGATE_STATEMENT_TIMEOUT_MS}ms`]);
+      const result = await client.query<R>(sql, params);
+      await client.query('COMMIT');
+      return result;
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   private buildPersistedSiteProfile(
@@ -1326,7 +1348,7 @@ export class PostgresSiteRepository implements SiteRepository {
         ORDER BY sc.count DESC`;
     }
 
-    const result = await this.pool.query<SlugCountRow>(sql, [safeLimit]);
+    const result = await this.queryAggregate<SlugCountRow>(sql, [safeLimit]);
 
     return summarizeDirectorySlugs(
       type,
@@ -1392,7 +1414,7 @@ export class PostgresSiteRepository implements SiteRepository {
       top_topics: Array<{ name: string; count: string }> | null;
     };
 
-    const result = await this.pool.query<InsightsRow>(`
+    const result = await this.queryAggregate<InsightsRow>(`
       WITH base AS (
         SELECT
           COUNT(*) AS total_sites,

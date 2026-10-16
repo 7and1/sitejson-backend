@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { PostgresSiteRepository } from '../postgres.js';
+import { fakePgPool } from './fake-pg-pool.js';
 
 vi.mock('pg', () => ({
   Pool: class {},
@@ -21,7 +22,7 @@ const row = {
 describe('PostgresSiteRepository global insights cache', () => {
   it('runs one aggregation for concurrent cold requests', async () => {
     const query = vi.fn().mockResolvedValue({ rows: [row] });
-    const repo = new PostgresSiteRepository({ query } as any);
+    const repo = new PostgresSiteRepository(fakePgPool(query).pool);
 
     const results = await Promise.all([repo.getGlobalInsights(), repo.getGlobalInsights(), repo.getGlobalInsights()]);
 
@@ -41,11 +42,11 @@ describe('PostgresSiteRepository global insights cache', () => {
       }),
     };
 
-    await new PostgresSiteRepository({ query } as any, { cacheRedis: redis }).getGlobalInsights();
+    await new PostgresSiteRepository(fakePgPool(query).pool, { cacheRedis: redis }).getGlobalInsights();
     await Promise.resolve();
     expect(store.has('sj:insights:global')).toBe(true);
 
-    const restarted = new PostgresSiteRepository({ query } as any, { cacheRedis: redis });
+    const restarted = new PostgresSiteRepository(fakePgPool(query).pool, { cacheRedis: redis });
     expect((await restarted.getGlobalInsights()).totalSites).toBe(100);
     expect(query).toHaveBeenCalledTimes(1);
   });

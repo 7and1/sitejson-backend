@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { PostgresSiteRepository } from '../postgres.js';
+import { fakePgPool } from './fake-pg-pool.js';
 
 vi.mock('pg', () => ({
   Pool: class {},
@@ -14,13 +15,17 @@ const rows = [
 describe('PostgresSiteRepository directory type summary', () => {
   it('serves every limit up to the default from one aggregation', async () => {
     const query = vi.fn().mockResolvedValue({ rows });
-    const repo = new PostgresSiteRepository({ query } as any);
+    const { pool, control } = fakePgPool(query);
+    const repo = new PostgresSiteRepository(pool);
 
     const full = await repo.getDirectoryTypeSummary('technology', 50);
     const top1 = await repo.getDirectoryTypeSummary('technology', 1);
 
     expect(query).toHaveBeenCalledTimes(1);
     expect(query.mock.calls[0][1]).toEqual([50]);
+    // Runs in its own transaction with the aggregate statement timeout.
+    expect(control.map((c) => c.sql)).toEqual(['BEGIN', 'SELECT set_config($1, $2, true)', 'COMMIT']);
+    expect(control[1].params).toEqual(['statement_timeout', '600000ms']);
     expect(full.totalSlugs).toBe(3);
     expect(full.totalSites).toBe(600);
     expect(top1).toEqual({
@@ -33,7 +38,7 @@ describe('PostgresSiteRepository directory type summary', () => {
 
   it('reads report_json only for the winning top domains, not in the full scan', async () => {
     const query = vi.fn().mockResolvedValue({ rows });
-    const repo = new PostgresSiteRepository({ query } as any);
+    const repo = new PostgresSiteRepository(fakePgPool(query).pool);
 
     await repo.getDirectoryTypeSummary('topic', 50);
 
