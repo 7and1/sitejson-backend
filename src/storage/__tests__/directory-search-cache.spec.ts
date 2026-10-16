@@ -43,6 +43,14 @@ describe('PostgresSiteRepository directory listing cache', () => {
     expect(String(query.mock.calls[0][0])).not.toContain('COUNT(*) OVER()');
     expect(statsSpy).toHaveBeenCalledWith('technology', 'react');
     expect(result.total).toBe(42);
+
+    // The page is picked by sort key alone; report_json is read only for the
+    // joined page rows, never in the filtered scan.
+    const sql = String(query.mock.calls[0][0]);
+    const pageSubquery = sql.slice(sql.indexOf('FROM ('), sql.indexOf(') page'));
+    expect(pageSubquery).toContain('ORDER BY COALESCE(rank_int, 999999999) ASC');
+    expect(pageSubquery).not.toContain('report_json');
+    expect(sql).toContain('JOIN site_profiles sp ON sp.domain = page.domain');
   });
 
   it('single-flights repeated searchDirectory calls for the same key', async () => {

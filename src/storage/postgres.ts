@@ -568,6 +568,7 @@ export class PostgresSiteRepository implements SiteRepository {
   private readonly directoryListingCache: SwrCache<DirectorySearchResult>;
   private readonly directoryTypeSummaryCache: SwrCache<DirectoryTypeSummary>;
   private readonly directoryStatsCache: SwrCache<DirectoryStats>;
+  private readonly globalInsightsCache: SwrCache<GlobalInsights>;
 
   constructor(private readonly pool: Pool, options?: { cacheRedis?: RedisLike }) {
     const redis = options?.cacheRedis;
@@ -590,6 +591,11 @@ export class PostgresSiteRepository implements SiteRepository {
       ttlMs: 900_000,
       maxEntries: 2000,
       persist: redis ? createRedisSwrPersistence<DirectoryStats>(redis, 'sj:dir:stats', redisTtlSeconds) : undefined,
+    });
+    this.globalInsightsCache = new SwrCache<GlobalInsights>({
+      ttlMs: 3600_000,
+      maxEntries: 1,
+      persist: redis ? createRedisSwrPersistence<GlobalInsights>(redis, 'sj:insights', redisTtlSeconds) : undefined,
     });
   }
 
@@ -1055,21 +1061,29 @@ export class PostgresSiteRepository implements SiteRepository {
     };
     const orderBy = options?.sort ? (sortMap[options.sort] ?? sortMap.rank) : 'COALESCE(rank_int, traffic_rank_int, 999999999) ASC';
 
+    // Pick the page by sort key first, then read report_json for just those
+    // rows: projecting report_json in the filtered scan detoasts every matching
+    // row before the top-N sort (technology/cloudflare: 6.9s -> 0.46s).
     const querySql = `SELECT
-         domain,
-         report_json->'meta'->>'title' AS title,
-         report_json->'meta'->>'description' AS description,
-         report_json->'meta'->'techStackDetected' AS tech_stack,
-         report_json->'visual'->>'screenshotUrl' AS screenshot_url,
-         report_json->'taxonomy'->'tags' AS tags,
-         report_json->'trafficData'->>'monthlyVisits' AS monthly_visits,
-         rank_int,
-         traffic_rank_int,
-         legitimacy_score_int
-       FROM site_profiles
-       ${whereClause}
-       ORDER BY ${orderBy}
-       LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+         sp.domain,
+         sp.report_json->'meta'->>'title' AS title,
+         sp.report_json->'meta'->>'description' AS description,
+         sp.report_json->'meta'->'techStackDetected' AS tech_stack,
+         sp.report_json->'visual'->>'screenshotUrl' AS screenshot_url,
+         sp.report_json->'taxonomy'->'tags' AS tags,
+         sp.report_json->'trafficData'->>'monthlyVisits' AS monthly_visits,
+         sp.rank_int,
+         sp.traffic_rank_int,
+         sp.legitimacy_score_int
+       FROM (
+         SELECT domain
+         FROM site_profiles
+         ${whereClause}
+         ORDER BY ${orderBy}
+         LIMIT $${params.length + 1} OFFSET $${params.length + 2}
+       ) page
+       JOIN site_profiles sp ON sp.domain = page.domain
+       ORDER BY ${orderBy}`;
 
     const [result, total] = canReuseCachedTotal
       ? await Promise.all([
@@ -1357,14 +1371,14 @@ export class PostgresSiteRepository implements SiteRepository {
     }
   }
 
-  private insightsCache: { data: GlobalInsights; expiresAt: number } | null = null;
-
   async getGlobalInsights(): Promise<GlobalInsights> {
-    const now = Date.now();
-    if (this.insightsCache && now < this.insightsCache.expiresAt) {
-      return this.insightsCache.data;
-    }
+    // Three full scans of site_profiles; serve stale-while-revalidate so the
+    // hourly expiry never puts the slow query (or a stampede of it) on the
+    // request path.
+    return this.globalInsightsCache.get('global', () => this.computeGlobalInsights());
+  }
 
+  private async computeGlobalInsights(): Promise<GlobalInsights> {
     type InsightsRow = {
       total_sites: string;
       with_traffic: string;
@@ -1449,7 +1463,6 @@ export class PostgresSiteRepository implements SiteRepository {
         : [],
     };
 
-    this.insightsCache = { data: insights, expiresAt: now + 3600_000 };
     return insights;
   }
 
